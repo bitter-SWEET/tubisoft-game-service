@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check that a second PC can reach the private XIII lab services.
+"""Check that a second PC can reach the XIII services.
 
 Run on the second PC with Python 3: python lan_preflight.py 192.0.2.10
 This checks service reachability, not the PS2 emulator's direct game traffic.
@@ -83,8 +83,9 @@ def main() -> int:
             print(f"{name} TCP {port}: FAIL ({exc})")
             failed = True
     try:
-        request = urllib.request.Request(f"http://{host}/gsinit.php?dp=XIIIPS2US")
-        # Do not send a local lab request through a desktop's HTTP proxy.
+        request = urllib.request.Request(f"http://{host}/gsinit.php?dp=XIIIPS2US",
+                                         headers={"Host": "gsconnect.ubisoft.com"})
+        # Reach the selected server directly, including its Ubisoft HTTP vhost.
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(request, timeout=3) as response:
             body = response.read(4096).decode("ascii")
