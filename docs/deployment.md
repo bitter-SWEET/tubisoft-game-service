@@ -19,6 +19,8 @@ The Compose image runs as UID/GID 10001 with a read-only root, no added capabili
 
 There are connection/concurrency and authentication-attempt limits; password hashing is offloaded with a bounded worker semaphore. These do not replace firewall restrictions. UDP host state and the NAT helper are bounded but do not implement every original SDK reliability/error branch.
 
+Docker's published bridge-network ports can bypass ordinary UFW input rules; see [Docker's firewall documentation](https://docs.docker.com/engine/network/packet-filtering-firewalls/#docker-and-ufw). Keep the application CIDR allowlist enabled and enforce any network allowlist at the provider firewall or the appropriate Docker-aware forwarding rules. Do not assume an absent UFW allow rule makes a published port private, and do not disable Docker's own firewall management to work around this.
+
 ## Start and inspect
 
 ```sh
@@ -31,6 +33,8 @@ curl --noproxy '*' 'http://127.0.0.1:18080/gsinit.php?dp=XIIIPS2US'
 ```
 
 Use the existing HTTP server and [bootstrap location](../deploy/nginx-bootstrap.conf) rather than replacing its configuration. Test the existing TSFP site and DNAS afterward. Keep the existing TSFP DNS responder and add only the Ubisoft bootstrap hostname to its redirect configuration. The operator must verify those integration changes against the actual host before enabling them.
+
+If the existing HTTP vhost redirects to HTTPS at server scope, use the separate [Ubisoft HTTP vhost](../deploy/nginx-tubisoft.conf) for `gsconnect.ubisoft.com`; adding a location underneath a server-level redirect is insufficient. The game uses plain HTTP here. Both templates disable client-side keep-alive for this response because XIII reads to EOF. Nginx's [keepalive_timeout documentation](https://nginx.org/en/docs/http/ngx_http_core_module.html#keepalive_timeout) explains the zero setting; closing only the upstream proxy connection does not establish EOF for the client. Leave the existing HTTPS/DNAS stream routing intact.
 
 A second emulator must resolve `gsconnect.ubisoft.com` to this service and complete the existing DNAS path. PCSX2 DHCP DNS settings require automatic DNS in the saved PS2 profile; see [the tester guide](local-test.md).
 
