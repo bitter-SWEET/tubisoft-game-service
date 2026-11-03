@@ -10,6 +10,40 @@ def registration():
 
 
 class RoomRegistryTests(unittest.TestCase):
+    def test_host_connections_require_ownership_and_only_the_last_departure_removes_the_room(self):
+        registry = RoomRegistry()
+        room = registry.register("host", "198.51.100.2", registration())
+        registry.activate(room.room_id, room.owner, room.peer_ip)
+        first, second, guest = object(), object(), object()
+        self.assertFalse(registry.bind_host(room, "guest", room.peer_ip, guest))
+        self.assertFalse(registry.bind_host(room, "host", "198.51.100.3", guest))
+        self.assertTrue(registry.bind_host(room, room.owner, room.peer_ip, first))
+        self.assertTrue(registry.bind_host(room, room.owner, room.peer_ip, second))
+        self.assertFalse(registry.unbind_host(room, guest))
+        self.assertFalse(registry.unbind_host(room, first))
+        self.assertIs(registry.active_room(room.room_id), room)
+        self.assertTrue(registry.unbind_host(room, second))
+        self.assertIsNone(registry.active_room(room.room_id))
+        self.assertFalse(registry.unbind_host(room, second))
+
+    def test_public_and_client_supplied_addresses_remain_distinct_and_nonempty(self):
+        registry = RoomRegistry()
+        room = registry.register("host", "198.51.100.2", registration())
+        registry.activate(room.room_id, room.owner, room.peer_ip)
+        self.assertEqual(room.game_started_fields()[1][3:], ["198.51.100.2", "192.0.2.2"])
+        self.assertEqual(room.group_fields()[18:], ["198.51.100.2", "192.0.2.2"])
+
+    def test_unusable_supplied_addresses_fall_back_to_observed_address(self):
+        for supplied in ("", "not-an-address", "0.0.0.0", "127.0.0.1", "255.255.255.255"):
+            with self.subTest(supplied=supplied):
+                registry = RoomRegistry()
+                values = registration()
+                values[2][13] = supplied
+                room = registry.register("host", "198.51.100.2", values)
+                registry.activate(room.room_id, room.owner, room.peer_ip)
+                self.assertEqual(room.game_started_fields()[1][3:], [room.peer_ip, room.peer_ip])
+                self.assertEqual(room.group_fields()[18:], [room.peer_ip, room.peer_ip])
+
     def test_remove_event_requires_owner_and_occurs_once(self):
         registry = RoomRegistry()
         room = registry.register("user", "192.0.2.2", registration())

@@ -61,6 +61,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
     logged_in_user: str | None = None
     wait_user: str | None = None
     host_room: rooms.Room | None = None
+    host_connection = object()
     joined_room: rooms.Room | None = None
     join_endpoint_sent = False
     host_member_notified = False
@@ -263,10 +264,14 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                     if not isinstance(fields[1], str) or not fields[1].isascii() or not fields[1].isdecimal():
                                         LOG.info("host lobby login rejected peer=%s: invalid room id", peer)
                                         break
-                                    host_room = registry.activate(int(fields[1]), fields[0].casefold(), peer[0])
-                                    if host_room is None:
+                                    candidate_host_room = registry.activate(int(fields[1]), fields[0].casefold(), peer[0])
+                                    if candidate_host_room is None:
                                         LOG.info("host lobby login rejected peer=%s: room ownership mismatch", peer)
                                         break
+                                    if host_room is not None and host_room is not candidate_host_room:
+                                        registry.unbind_host(host_room, host_connection)
+                                    host_room = candidate_host_room
+                                    registry.bind_host(host_room, fields[0].casefold(), peer[0], host_connection)
                                 payload = gsxor.encrypt(data.encode(["210", [fields[1]]]))
                                 writer.write(response_header(header, payload, 0x26) + payload)
                                 await writer.drain()
@@ -342,11 +347,16 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                     LOG.info("room join rejected peer=%s: room unavailable", peer)
                                     break
                                 member = (peer[0], wait_user.casefold())
+                                if host_room is not None and host_room is not room:
+                                    registry.unbind_host(host_room, host_connection)
+                                    host_room = None
                                 if joined_room is not None:
                                     joined_room.members.discard(member)
                                     joined_room.member_info.pop(member, None)
                                 room.members.add(member)
                                 joined_room = room
+                                if registry.bind_host(room, wait_user.casefold(), peer[0], host_connection):
+                                    host_room = room
                                 join_endpoint_sent = False
                                 host_member_notified = False
                                 # XIII parser 0x01d72af0 expects the room ID in
@@ -424,6 +434,10 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                 await writer.drain()
                                 LOG.info("room leave accepted peer=%s group=%s; sign-in session retained", peer, group_id)
                                 joined_room = None
+                                if host_room is not None:
+                                    removed = registry.unbind_host(host_room, host_connection)
+                                    LOG.info("owner left room peer=%s room=%d removed=%s", peer, host_room.room_id, removed)
+                                    host_room = None
                                 continue
                             LOG.info("unsupported lobby request peer=%s subtype=%d nested_types=%s", peer, subtype,
                                      [type(item).__name__ for item in fields[1]])
@@ -443,8 +457,8 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
             if host_probe is not None and host_member_notified:
                 host_probe.notify_host(joined_room, [["51", [wait_user]]])
         if host_room is not None:
-            registry.remove(host_room.room_id, host_room.owner, host_room.peer_ip)
-            LOG.info("host connection closed; room removed id=%d", host_room.room_id)
+            removed = registry.unbind_host(host_room, host_connection)
+            LOG.info("owner room connection closed peer=%s room=%d removed=%s", peer, host_room.room_id, removed)
         writer.close()
         try:
             await writer.wait_closed()

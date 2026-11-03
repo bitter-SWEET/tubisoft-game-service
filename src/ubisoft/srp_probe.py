@@ -87,17 +87,27 @@ class Probe(asyncio.DatagramProtocol):
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport  # type: ignore[assignment]
+        self.registry.add_remove_listener(self.room_removed)
         LOG.info("experimental UDP probe listening at %s", transport.get_extra_info("sockname"))
         self.cleanup = asyncio.get_running_loop().call_later(30, self.expire_sessions)
         self.retries = asyncio.get_running_loop().call_later(1, self.retry_notifications)
 
     def connection_lost(self, exc: Exception | None) -> None:
+        self.registry.remove_remove_listener(self.room_removed)
         if self.cleanup is not None:
             self.cleanup.cancel()
         if self.retries is not None:
             self.retries.cancel()
         for peer in list(self.sessions):
             self.remove_session(peer)
+
+    def room_removed(self, room: rooms.Room) -> None:
+        # A room can close through its owner's TCP membership connection,
+        # independently of UDP FIN. Discard its transport and retry state too.
+        for peer, session in list(self.sessions.items()):
+            if session.room is room:
+                self.sessions.pop(peer, None)
+                LOG.info("UDP host transport cleared for closed room peer=%s room=%d", peer, room.room_id)
 
     def remove_session(self, peer: tuple[str, int]) -> None:
         session = self.sessions.pop(peer, None)

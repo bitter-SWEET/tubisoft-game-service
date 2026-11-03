@@ -38,6 +38,95 @@ class Writer:
 
 
 class HandoffTests(unittest.IsolatedAsyncioTestCase):
+    async def test_owner_room_disconnect_clears_udp_registration_and_notifies_guest_without_logout(self):
+        registry = RoomRegistry()
+        host_ip, guest_ip = "192.0.2.2", "192.0.2.3"
+        room = registry.register("host", host_ip, ["12", "1", [
+            "launcher", "1", "Example", "XIIIPS2US", "6", "16", "0", b"info", b"\0", "",
+            "1.0", "XIIIPS21.0", "8208", host_ip, "7777", b""]])
+        registry.activate(room.room_id, room.owner, room.peer_ip)
+        probe = srp_probe.Probe({}, registry)
+        probe.connection_made(SimpleNamespace(sendto=lambda *args: None,
+                                             get_extra_info=lambda name: ("192.0.2.1", 30000)))
+        self.addCleanup(probe.connection_lost, None)
+        host_peer = (host_ip, 1024)
+        probe.sessions[host_peer] = srp_probe.Session(0x1234, 0, room=room)
+        guest_reader = asyncio.StreamReader()
+        guest_reader.feed_data(frame(0xd2, ["guest", "1", "", "", ""]))
+        guest_reader.feed_data(frame(0xd1, ["24", [str(room.room_id), "", "0", "0", "XIIIPS2US"]]))
+        guest_writer = Writer(guest_ip, 30000)
+        task = asyncio.create_task(router.handle(
+            guest_reader, guest_writer, None, 2, Path("/unused"), "192.0.2.1", 30000,
+            {(guest_ip, "guest"): time.monotonic() + 60}, {}, registry, probe))
+        try:
+            async def joined():
+                while (guest_ip, "guest") not in room.members:
+                    await asyncio.sleep(0)
+            await asyncio.wait_for(joined(), 1)
+            host_reader = asyncio.StreamReader()
+            host_reader.feed_data(frame(0xd2, ["host", "1", "", "", ""]))
+            host_reader.feed_data(frame(0xd1, ["24", [str(room.room_id), "", "0", "0", "XIIIPS2US"]]))
+            host_reader.feed_data(frame(0xd1, ["42", [b""]]))
+            host_reader.feed_eof()
+            await router.handle(host_reader, Writer(host_ip, 30000), None, 2, Path("/unused"),
+                                "192.0.2.1", 30000, {(host_ip, "host"): time.monotonic() + 60}, {}, registry, probe)
+            self.assertIsNone(registry.active_room(room.room_id))
+            self.assertNotIn(host_peer, probe.sessions)
+            guest_reader.feed_data(frame(0xd1, ["9", ["1"]]))
+            guest_reader.feed_eof()
+            await task
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        replies = []
+        offset = 0
+        while offset < len(guest_writer.output):
+            header = GSHeader.decode(guest_writer.output[offset:offset + HEADER_SIZE])
+            replies.append(data.decode(gsxor.decrypt(bytes(guest_writer.output[offset + HEADER_SIZE:offset + header.size]))))
+            offset += header.size
+        self.assertEqual(replies[-2:], [["55", [str(room.room_id)]], ["53", ["1", "256", router.PARENT_LOBBY, []]]])
+
+    async def test_owner_leaving_group_removes_room_but_keeps_browser_connection(self):
+        registry = RoomRegistry()
+        host_ip = "192.0.2.2"
+        room = registry.register("host", host_ip, ["12", "1", [
+            "launcher", "1", "Example", "XIIIPS2US", "6", "16", "0", b"info", b"\0", "",
+            "1.0", "XIIIPS21.0", "8208", host_ip, "7777", b""]])
+        registry.activate(room.room_id, room.owner, room.peer_ip)
+        reader = asyncio.StreamReader()
+        reader.feed_data(frame(0xd2, ["host", "1", "", "", ""]))
+        reader.feed_data(frame(0xd1, ["24", [str(room.room_id), "", "0", "0", "XIIIPS2US"]]))
+        reader.feed_data(frame(0xd1, ["8", ["0"]]))
+        reader.feed_data(frame(0xd1, ["9", ["1"]]))
+        reader.feed_eof()
+        writer = Writer(host_ip, 30000)
+        await router.handle(reader, writer, None, 1, Path("/unused"), "192.0.2.1", 30000,
+                            {(host_ip, "host"): time.monotonic() + 60}, {}, registry)
+        replies = []
+        offset = 0
+        while offset < len(writer.output):
+            header = GSHeader.decode(writer.output[offset:offset + HEADER_SIZE])
+            replies.append(data.decode(gsxor.decrypt(bytes(writer.output[offset + HEADER_SIZE:offset + header.size]))))
+            offset += header.size
+        self.assertEqual(replies[-2:], [["38", ["8", ["0"]]], ["53", ["1", "256", router.PARENT_LOBBY, []]]])
+        self.assertEqual(registry.children(), [])
+
+    async def test_owner_discovery_connection_close_does_not_remove_hosted_room(self):
+        registry = RoomRegistry()
+        host_ip = "192.0.2.2"
+        room = registry.register("host", host_ip, ["12", "1", [
+            "launcher", "1", "Example", "XIIIPS2US", "6", "16", "0", b"info", b"\0", "",
+            "1.0", "XIIIPS21.0", "8208", host_ip, "7777", b""]])
+        registry.activate(room.room_id, room.owner, room.peer_ip)
+        reader = asyncio.StreamReader()
+        reader.feed_data(frame(0xd2, ["host", "1", "", "", ""]))
+        reader.feed_data(frame(0xd1, ["9", ["1"]]))
+        reader.feed_eof()
+        await router.handle(reader, Writer(host_ip, 30000), None, 1, Path("/unused"), "192.0.2.1", 30000,
+                            {(host_ip, "host"): time.monotonic() + 60}, {}, registry)
+        self.assertIs(registry.active_room(room.room_id), room)
+
     async def test_host_room_removal_notifies_guest_and_preserves_authenticated_lobby(self):
         registry = RoomRegistry()
         host_ip, guest_ip = "192.0.2.2", "192.0.2.3"
@@ -82,7 +171,7 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(authenticated[(guest_ip, "guest")], time.monotonic())
         self.assertEqual(room.members, set())
 
-    async def test_host_self_join_accepts_empty_player_info_and_keeps_lobby_usable(self):
+    async def test_host_self_join_accepts_empty_player_info_until_owner_connection_closes(self):
         registry = RoomRegistry()
         host_ip = "192.0.2.2"
         room = registry.register("host", host_ip, ["12", "1", [
@@ -108,7 +197,7 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(["38", ["42"]], replies)
         self.assertIn(room.game_started_fields(), replies)
         self.assertEqual(replies[-1], ["38", ["46", [str(room.room_id), b""]]])
-        self.assertIs(registry.active_room(room.room_id), room)
+        self.assertIsNone(registry.active_room(room.room_id))
 
     async def test_launcher_disconnect_does_not_discard_pending_host_room(self):
         registry = RoomRegistry()
@@ -222,7 +311,7 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replies[3][1][1][:2], [str(room.room_id), "64"])
         self.assertEqual(replies[3][1][1][2][13], "2")
         self.assertEqual(replies[4:], [(0xd1, ["38", ["42"]]),
-                                        (0xd1, ["56", [str(room.room_id), b"", "7777", host_ip, ""]]),
+                                        (0xd1, ["56", [str(room.room_id), b"", "7777", host_ip, host_ip]]),
                                         (0xd1, ["38", ["42"]]),
                                         (0xd1, ["38", ["8", [str(room.room_id)]]])])
         self.assertEqual(room.members, set())

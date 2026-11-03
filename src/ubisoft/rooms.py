@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from collections.abc import Callable
+import ipaddress
 import time
 
 PENDING_ROOM_SECONDS = 120
@@ -34,19 +35,22 @@ class Room:
     game_port: str
     game_version: str
     sdk_version: str
+    local_ip: str = ""
     active: bool = False
     pending_until: float = 0
     members: set[tuple[str, str]] = field(default_factory=set)
     member_info: dict[tuple[str, str], bytes] = field(default_factory=dict)
+    host_connections: set[object] = field(default_factory=set, repr=False)
 
     def game_started_fields(self) -> list:
         """Host endpoint consumed by XIII's game-started/join callback.
 
         The XIII parser reads room ID, opaque binary data, a decimal uint16
         port, and two address strings. Its game callback ignores the binary
-        data. No alternate reachable address is known for this LAN service.
+        data. When the public address matches its own, XIII can select the
+        second address; keep it nonempty to avoid its unchecked lookup path.
         """
-        return ["56", [str(self.room_id), b"", self.game_port, self.peer_ip, ""]]
+        return ["56", [str(self.room_id), b"", self.game_port, self.peer_ip, self.local_ip or self.peer_ip]]
 
     def group_fields(self) -> list:
         """Candidate GS child-group record; client validation is pending."""
@@ -56,7 +60,7 @@ class Room:
         return [self.group_type, self.name, str(self.room_id), "1", self.parent_id,
                 advertised_flags, "2", self.owner, "", self.product, self.info, "0",
                 self.max_players, str(player_count), self.max_spectators, "0",
-                self.game_version, self.sdk_version, self.peer_ip, ""]
+                self.game_version, self.sdk_version, self.peer_ip, self.local_ip or self.peer_ip]
 
 
 class RoomRegistry:
@@ -93,10 +97,20 @@ class RoomRegistry:
             raise ValueError("registration data exceeds local limit")
         if any(room.owner == owner and room.peer_ip == peer_ip for room in self._rooms.values()):
             raise ValueError("owner already has a registered room")
+        # The launcher supplies its connection address at index 13. Retain a
+        # usable IPv4 value, otherwise use the observed address as a nonempty
+        # fallback. Never put a missing/invalid hostname into the join reply.
+        try:
+            local = ipaddress.IPv4Address(values[13])
+            if local.is_unspecified or local.is_multicast or local.is_loopback or int(local) == 0xffffffff:
+                raise ValueError("unusable supplied address")
+            local_ip = str(local)
+        except ValueError:
+            local_ip = peer_ip
         room = Room(self._next_id, owner, peer_ip, values[2], values[3], values[4],
                     values[1], values[12], values[5], values[6], values[7], values[15],
                     values[14], values[10], values[11],
-                    pending_until=time.monotonic() + PENDING_ROOM_SECONDS)
+                    local_ip=local_ip, pending_until=time.monotonic() + PENDING_ROOM_SECONDS)
         self._next_id += 1
         self._rooms[room.room_id] = room
         return room
@@ -117,10 +131,28 @@ class RoomRegistry:
             if not room.active and room.pending_until <= now:
                 del self._rooms[room_id]
 
+    def bind_host(self, room: Room, owner: str, peer_ip: str, connection: object) -> bool:
+        """Bind only the authenticated owner's actual room connection."""
+        if self.active_room(room.room_id) is not room or (owner, peer_ip) != (room.owner, room.peer_ip):
+            return False
+        room.host_connections.add(connection)
+        return True
+
+    def unbind_host(self, room: Room, connection: object) -> bool:
+        if connection not in room.host_connections:
+            return False
+        room.host_connections.remove(connection)
+        if not room.host_connections and self.active_room(room.room_id) is room:
+            self.remove(room.room_id, room.owner, room.peer_ip)
+            return True
+        return False
+
     def remove(self, room_id: int, owner: str, peer_ip: str) -> None:
         room = self._rooms.get(room_id)
         if room is not None and room.owner == owner and room.peer_ip == peer_ip:
             del self._rooms[room_id]
+            room.active = False
+            room.host_connections.clear()
             for listener in tuple(self._remove_listeners):
                 listener(room)
 
