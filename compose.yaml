@@ -13,7 +13,7 @@ services:
     tmpfs: [/tmp:rw,noexec,nosuid,size=16m]
     environment:
       TUBISOFT_ADVERTISE_IP: ${TUBISOFT_ADVERTISE_IP:?Set the server IPv4 address}
-      TUBISOFT_ALLOWED_CIDRS: ${TUBISOFT_ALLOWED_CIDRS:?Set tester CIDRs}
+      TUBISOFT_ALLOWED_CIDRS: ${TUBISOFT_ALLOWED_CIDRS:-0.0.0.0/0}
       TUBISOFT_BIND_IP: 0.0.0.0
       TUBISOFT_STATE_DIR: /state
       TUBISOFT_ROUTER_PORT: ${TUBISOFT_ROUTER_PORT:-30000}

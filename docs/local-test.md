@@ -15,7 +15,7 @@ Optional service check, from a checkout or with the standalone script:
 python tools/lan_preflight.py 192.0.2.10
 ```
 
-Replace the example address. This checks DNS, bootstrap, and TCP reachability, not complete peer UDP behavior. The operator must allow your public address in the beta allowlist.
+Replace the example address. This checks DNS, bootstrap, and TCP reachability, not complete peer UDP behavior. The public beta does not require your address to be enrolled.
 
 ## Two-player test
 

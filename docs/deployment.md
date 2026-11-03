@@ -1,17 +1,17 @@
-# Restricted beta deployment
+# Open beta deployment
 
-Tubisoft is a standalone Python service with a private SQLite/key volume. The observed game workflow is playable, but the legacy protocol and incomplete session authentication are unsuitable for an unrestricted public registration service. Limit the beta to intended testers.
+Tubisoft is a standalone Python service with a private SQLite/key volume. The open beta accepts account creation and game connections from any IPv4 address. Existing protocol limitations are documented in the README; connection, resource, and authentication-attempt limits remain enabled.
 
 ## Configuration and ports
 
-Copy `.env.example` to the ignored `.env`, set its permissions to 0600, and replace its example values. `TUBISOFT_ADVERTISE_IP` must be the IPv4 address reachable by the games, not a wildcard/container address. `TUBISOFT_ALLOWED_CIDRS` is a comma-separated list of tester public `/32` addresses, trusted LANs, or VPN ranges. Both router TCP connections and NAT discovery use that allowlist. Moving the files to another machine requires its own environment and fresh runtime secrets.
+Copy `.env.example` to the ignored `.env`, set its permissions to 0600, and replace its example values. `TUBISOFT_ADVERTISE_IP` must be the IPv4 address reachable by the games, not a wildcard/container address. `TUBISOFT_ALLOWED_CIDRS` defaults to `0.0.0.0/0` for open access. Operators of private installations can optionally set a comma-separated list of IPv4 CIDRs; both router TCP connections and NAT discovery use that setting. Moving the files to another machine requires its own environment and fresh runtime secrets.
 
 | Listener | Role | Sharing plan |
 | --- | --- | --- |
 | TCP 80 | Retail bootstrap | Existing HTTP proxy forwards only `/gsinit.php` to loopback 18080. |
-| TCP/UDP 30000 | Router, lobby, host reliable UDP | Tubisoft listener; allow tester sources. |
-| TCP 30001 | Launcher/registration | Tubisoft listener; allow tester sources. |
-| UDP 30002 | NAT discovery/probe | Tubisoft listener; allow tester sources. |
+| TCP/UDP 30000 | Router, lobby, host reliable UDP | Tubisoft listener; open access. |
+| TCP 30001 | Launcher/registration | Tubisoft listener; open access. |
+| UDP 30002 | NAT discovery/probe | Tubisoft listener; open access. |
 | UDP 53 and TCP 443 | Existing DNS and DNAS | Reuse the platform setup; Tubisoft does not bind either. |
 | Host game UDP, commonly 7777 | Direct peer gameplay | Runs on the player PC/PS2, not the VPS. Guest ports may be dynamic. |
 
@@ -19,7 +19,7 @@ The Compose image runs as UID/GID 10001 with a read-only root, no added capabili
 
 There are connection/concurrency and authentication-attempt limits; password hashing is offloaded with a bounded worker semaphore. These do not replace firewall restrictions. UDP host state and the NAT helper are bounded but do not implement every original SDK reliability/error branch.
 
-Docker's published bridge-network ports can bypass ordinary UFW input rules; see [Docker's firewall documentation](https://docs.docker.com/engine/network/packet-filtering-firewalls/#docker-and-ufw). Keep the application CIDR allowlist enabled and enforce any network allowlist at the provider firewall or the appropriate Docker-aware forwarding rules. Do not assume an absent UFW allow rule makes a published port private, and do not disable Docker's own firewall management to work around this.
+Docker's published bridge-network ports can bypass ordinary UFW input rules; see [Docker's firewall documentation](https://docs.docker.com/engine/network/packet-filtering-firewalls/#docker-and-ufw). For an optional private deployment, enforce any network allowlist both in the application and at the provider firewall or appropriate Docker-aware forwarding rules. Do not assume an absent UFW allow rule makes a published port private, and do not disable Docker's own firewall management to work around this.
 
 ## Start and inspect
 

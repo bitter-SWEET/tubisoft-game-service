@@ -58,7 +58,7 @@ def configuration(environment=None):
     address = str(ipaddress.IPv4Address(env["TUBISOFT_ADVERTISE_IP"]))
     if ipaddress.IPv4Address(address).is_unspecified:
         raise ValueError("advertised address cannot be a wildcard")
-    allowed = env["TUBISOFT_ALLOWED_CIDRS"]
+    allowed = env.get("TUBISOFT_ALLOWED_CIDRS", "0.0.0.0/0")
     networks(allowed)
     def port(name, default):
         value = int(env.get("TUBISOFT_" + name, default))
@@ -107,7 +107,7 @@ def main() -> None:
         args = configuration()
         asyncio.run(run(args))
     except (KeyError, ValueError) as exc:
-        raise SystemExit("Invalid Tubisoft configuration; set a reachable IPv4 address and explicit tester CIDRs.") from exc
+        raise SystemExit("Invalid Tubisoft configuration; set a reachable IPv4 address and valid optional CIDRs.") from exc
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
 

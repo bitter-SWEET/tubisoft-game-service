@@ -2,7 +2,7 @@
 
 An experimental Ubisoft Game Services revival for PS2. The name is a play on Tubi and Ubisoft.
 
-Two unmodified **XIII USA** clients (`SLUS-20677`, CRC `FCD97245`) have created accounts, signed in, discovered a room, joined the same LAN match, and played together. NAT discovery, host-side peer-opening notifications, score-list updates, and host-exit room removal have been exercised. This release packages that implementation for a **restricted beta**, not an unrestricted public account service.
+Two unmodified **XIII USA** clients (`SLUS-20677`, CRC `FCD97245`) have created accounts, signed in, discovered a room, joined the same LAN match, and played together. NAT discovery, host-side peer-opening notifications, score-list updates, and host-exit room removal have been exercised. This release packages that implementation for an **open beta**. Anyone can create a game account and connect; no tester approval or IP enrollment is required.
 
 The common `ubisoft` package provides GS framing, crypto, accounts, lobby state, and NAT discovery. XIII-specific data codecs live in `ubisoft.games.xiii`. Compatibility with another Ubisoft title has not been established.
 
@@ -13,7 +13,7 @@ Requires Docker with Compose. The image is self-contained; no TSFP checkout, dis
 ```sh
 cp .env.example .env
 chmod 600 .env
-# Edit the advertised IPv4 address and tester allowlist in .env.
+# Edit the advertised IPv4 address in .env. Open access is the default.
 docker compose up -d --build
 docker compose ps
 curl --noproxy '*' 'http://127.0.0.1:18080/gsinit.php?dp=XIIIPS2US'
@@ -40,7 +40,7 @@ Copy backups to private storage outside the host. Never use `docker compose down
 
 ## Beta limits
 
-- Allow only intended testers using `TUBISOFT_ALLOWED_CIDRS` and host firewall rules. The original game requires obsolete RSA/Blowfish formats. Use a unique game-only password.
+- The original game requires obsolete RSA/Blowfish formats. Use a unique game-only password. Resource and authentication-attempt limits remain enabled; optional `TUBISOFT_ALLOWED_CIDRS` restrictions are available for private installations.
 - Some handoffs still correlate by source IP and account name; launcher login assumes one recent account per source IP. Multiple testers behind one public NAT and strong public-service authentication need more work.
 - Peer gameplay is direct UDP, **not relayed by Tubisoft**. LAN gameplay is verified; separate-network/NAT combinations require testing. NAT discovery alone does not make every host reachable.
 - Invalid-login and duplicate-account failure replies, password-protected rooms, persistent rankings, and full SDK operation coverage remain incomplete. Failed operations can time out.

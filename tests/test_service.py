@@ -12,6 +12,12 @@ from ubisoft.frame import GSHeader, read_frame
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_public_beta_accepts_any_source_without_tester_configuration(self):
+        args = configuration({"TUBISOFT_ADVERTISE_IP": "192.0.2.10"})
+        self.assertTrue(args.access_policy.acquire("198.51.100.22"))
+        self.assertTrue(args.access_policy.acquire("203.0.113.32"))
+        self.assertEqual(args.nat_allowed_cidr, "0.0.0.0/0")
+
     def test_reachable_advertisement_and_explicit_access_are_required(self):
         for env in ({}, {"TUBISOFT_ADVERTISE_IP": "0.0.0.0", "TUBISOFT_ALLOWED_CIDRS": "127.0.0.0/8"},
                     {"TUBISOFT_ADVERTISE_IP": "192.0.2.10", "TUBISOFT_ALLOWED_CIDRS": ""}):
