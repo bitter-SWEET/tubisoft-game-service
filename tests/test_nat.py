@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from ubisoft import data, gsxor
 from ubisoft.frame import GSHeader, HEADER_SIZE
-from ubisoft.nat import Discovery, SESSION_SECONDS
+from ubisoft.nat import Discovery, SESSION_SECONDS, RETRY_SECONDS, MAX_RETRIES
 from ubisoft.srp_probe import HEADER, WINDOW, ACK, IDENT, SYN, checksum
 
 
@@ -50,6 +50,82 @@ class NatTests(unittest.IsolatedAsyncioTestCase):
     def handshake(self, helper, peer):
         helper.datagram_received(HEADER.pack(0, 0, 8, IDENT | SYN, 0, 0)
                                  + WINDOW.pack(10, 0x1234, 0, 536), peer)
+
+    async def test_lost_port_and_address_replies_are_retried_identically_until_acknowledged(self):
+        helper, transport = self.start()
+        peer = ("192.0.2.2", 1026)
+        clock = [time.monotonic()]
+        with patch("ubisoft.nat.time.monotonic", side_effect=lambda: clock[0]):
+            self.handshake(helper, peer)
+            helper.datagram_received(control_request(), peer)
+            port_packet = transport.sent[-1]
+            count = len(transport.sent)
+            helper.retry_pending()
+            self.assertEqual(len(transport.sent), count)
+            clock[0] += RETRY_SECONDS
+            helper.retry_pending()
+            self.assertEqual(transport.sent[count:], [port_packet])
+            sequence = HEADER.unpack_from(port_packet[0])[4]
+            helper.datagram_received(HEADER.pack(0, 0x1234, 0, IDENT | ACK, 0xffff, sequence), peer)
+            count = len(transport.sent)
+            clock[0] += RETRY_SECONDS
+            helper.retry_pending()
+            self.assertEqual(len(transport.sent), count)
+
+            token = int(fields(port_packet[0])[1][1][1]).to_bytes(4, "big")
+            helper.datagram_received(token, (peer[0], 7777))
+            address_packet = transport.sent[-1]
+            count = len(transport.sent)
+            clock[0] += RETRY_SECONDS
+            helper.retry_pending()
+            self.assertEqual(transport.sent[count:], [address_packet])
+            sequence = HEADER.unpack_from(address_packet[0])[4]
+            helper.datagram_received(HEADER.pack(0, 0x1234, 0, IDENT | ACK, 0xffff, sequence), peer)
+            count = len(transport.sent)
+            clock[0] += RETRY_SECONDS
+            helper.retry_pending()
+            self.assertEqual(len(transport.sent), count)
+
+    async def test_retries_are_bounded_and_do_not_keep_dead_or_removed_sessions_alive(self):
+        helper, transport = self.start()
+        peer = ("192.0.2.2", 1026)
+        clock = [time.monotonic()]
+        with patch("ubisoft.nat.time.monotonic", side_effect=lambda: clock[0]):
+            self.handshake(helper, peer)
+            helper.datagram_received(control_request(), peer)
+            original = transport.sent[-1]
+            last_seen = helper.sessions[peer].last_seen
+            count = len(transport.sent)
+            for _ in range(MAX_RETRIES + 2):
+                clock[0] += RETRY_SECONDS
+                helper.retry_pending()
+            self.assertEqual(transport.sent[count:], [original] * MAX_RETRIES)
+            self.assertEqual(helper.sessions[peer].last_seen, last_seen)
+
+            self.handshake(helper, peer)
+            helper.datagram_received(control_request(), peer)
+            count = len(transport.sent)
+            clock[0] += SESSION_SECONDS + 1
+            helper.retry_pending()
+            self.assertEqual(len(transport.sent), count)
+            helper.remove(peer)
+            helper.retry_pending()
+            self.assertEqual(len(transport.sent), count)
+
+    async def test_correlated_game_probe_stops_port_retries_even_without_its_ack(self):
+        helper, transport = self.start()
+        peer = ("192.0.2.2", 1026)
+        clock = [time.monotonic()]
+        with patch("ubisoft.nat.time.monotonic", side_effect=lambda: clock[0]):
+            self.handshake(helper, peer)
+            helper.datagram_received(control_request(), peer)
+            token = int(fields(transport.sent[-1][0])[1][1][1]).to_bytes(4, "big")
+            helper.datagram_received(token, (peer[0], 7777))
+            address_packet = transport.sent[-1]
+            count = len(transport.sent)
+            clock[0] += RETRY_SECONDS
+            helper.retry_pending()
+            self.assertEqual(transport.sent[count:], [address_packet])
 
     async def test_diagnostics_distinguish_unacknowledged_and_completed_lookups_without_logging_tokens(self):
         helper, transport = self.start()

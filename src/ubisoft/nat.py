@@ -22,6 +22,8 @@ from .srp_probe import HEADER, WINDOW, ACK, FIN, IDENT, SYN, SEQUENCE_MODULUS, c
 LOG = logging.getLogger("ubisoft.nat")
 SESSION_SECONDS = 300
 MAX_SESSIONS = 256
+RETRY_SECONDS = 1
+MAX_RETRIES = 10
 
 
 @dataclass
@@ -33,9 +35,14 @@ class Request:
     header: GSHeader
     port_sequence: int | None = None
     port_acknowledged: bool = False
+    port_reply: bytes | None = None
+    port_retry_at: float = 0
+    port_retries: int = 0
     address_reply: bytes | None = None
     address_sequence: int | None = None
     acknowledged: bool = False
+    address_retry_at: float = 0
+    address_retries: int = 0
 
 
 @dataclass
@@ -56,17 +63,21 @@ class Discovery(asyncio.DatagramProtocol):
         self.sessions: dict[tuple[str, int], Session] = {}
         self.tokens: dict[bytes, Request] = {}
         self.cleanup: asyncio.TimerHandle | None = None
+        self.retries: asyncio.TimerHandle | None = None
         self.port = 0
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport  # type: ignore[assignment]
         self.port = transport.get_extra_info("sockname")[1]
         self.cleanup = asyncio.get_running_loop().call_later(30, self.expire)
+        self.retries = asyncio.get_running_loop().call_later(RETRY_SECONDS, self.retry_pending)
         LOG.info("experimental NAT discovery listening at %s", transport.get_extra_info("sockname"))
 
     def connection_lost(self, exc: Exception | None) -> None:
         if self.cleanup is not None:
             self.cleanup.cancel()
+        if self.retries is not None:
+            self.retries.cancel()
         self.sessions.clear()
         self.tokens.clear()
 
@@ -90,6 +101,35 @@ class Discovery(asyncio.DatagramProtocol):
     def send(self, packet: bytes, peer: tuple[str, int]) -> None:
         if self.transport is not None:
             self.transport.sendto(packet, peer)
+
+    def retry_pending(self) -> None:
+        """Replay identical unacknowledged replies without extending session life."""
+        if self.retries is not None:
+            self.retries.cancel()
+        now = time.monotonic()
+        for peer, session in self.sessions.items():
+            if now - session.last_seen > SESSION_SECONDS:
+                continue
+            for request in session.requests.values():
+                # A correlated game probe proves the client consumed the port
+                # reply, even when its separate transport ACK was lost.
+                pending = (("port", "2", request.port_reply,
+                            request.port_acknowledged or request.address_reply is not None,
+                            request.port_sequence),
+                           ("address", "3", request.address_reply,
+                            request.acknowledged, request.address_sequence))
+                for prefix, subtype, packet, acknowledged, sequence in pending:
+                    attempts = getattr(request, prefix + "_retries")
+                    deadline = getattr(request, prefix + "_retry_at")
+                    if packet is None or acknowledged or attempts >= MAX_RETRIES or now < deadline:
+                        continue
+                    self.send(packet, peer)
+                    attempts += 1
+                    setattr(request, prefix + "_retries", attempts)
+                    setattr(request, prefix + "_retry_at", now + RETRY_SECONDS)
+                    LOG.info("NAT control reply retried peer=%s subtype=%s request=%s sequence=%d retry=%d",
+                             peer, subtype, request.request_id, sequence, attempts)
+        self.retries = asyncio.get_running_loop().call_later(RETRY_SECONDS, self.retry_pending)
 
     def reply(self, session: Session, request: Request, subtype: str, address: int, port: int) -> tuple[int, bytes]:
         payload = gsxor.encrypt(data.encode([subtype, [request.request_id, str(address), str(port)]]))
@@ -124,6 +164,7 @@ class Discovery(asyncio.DatagramProtocol):
             sequence, reply = self.reply(session, request, "3", address, peer[1])
             request.address_sequence = sequence
             request.address_reply = reply
+            request.address_retry_at = time.monotonic() + RETRY_SECONDS
             LOG.info("game endpoint observed control_peer=%s game_peer=%s request=%s",
                      request.peer, peer, request.request_id)
         if not request.acknowledged:
@@ -214,5 +255,7 @@ class Discovery(asyncio.DatagramProtocol):
         # socket to send those four bytes to the advertised NAT service port.
         sequence, response = self.reply(session, request, "2", int.from_bytes(token, "big"), self.port)
         request.port_sequence = sequence
+        request.port_reply = response
+        request.port_retry_at = time.monotonic() + RETRY_SECONDS
         self.send(response, peer)
         LOG.info("NAT game-socket probe requested peer=%s request=%s", peer, request_id)
