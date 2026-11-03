@@ -1,0 +1,14 @@
+# Experimental GR2 bootstrap/shared-auth research alongside working XIII.
+# docker compose -f compose.yaml -f deploy/compose.gr2.yaml up -d --build
+services:
+  game-service:
+    environment:
+      TUBISOFT_GAMES: xiii,gr2
+      TUBISOFT_GR2_ROUTER_PORT: ${TUBISOFT_GR2_ROUTER_PORT:-30010}
+      TUBISOFT_GR2_LAUNCHER_PORT: ${TUBISOFT_GR2_LAUNCHER_PORT:-30011}
+      TUBISOFT_GR2_NAT_PORT: ${TUBISOFT_GR2_NAT_PORT:-30012}
+    ports:
+      - "${TUBISOFT_GR2_ROUTER_PORT:-30010}:${TUBISOFT_GR2_ROUTER_PORT:-30010}/tcp"
+      - "${TUBISOFT_GR2_ROUTER_PORT:-30010}:${TUBISOFT_GR2_ROUTER_PORT:-30010}/udp"
+      - "${TUBISOFT_GR2_LAUNCHER_PORT:-30011}:${TUBISOFT_GR2_LAUNCHER_PORT:-30011}/tcp"
+      - "${TUBISOFT_GR2_NAT_PORT:-30012}:${TUBISOFT_GR2_NAT_PORT:-30012}/udp"

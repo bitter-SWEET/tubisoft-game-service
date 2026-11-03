@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 from . import accounts, bootstrap, router
 from .access import AccessPolicy, networks
+from .games.registry import bindings
 
 
 class PrivacyFormatter(logging.Formatter):
@@ -66,6 +67,7 @@ def configuration(environment=None):
             raise ValueError("invalid service port")
         return value
     return SimpleNamespace(
+        games=bindings(env),
         bind=str(ipaddress.IPv4Address(env.get("TUBISOFT_BIND_IP", "0.0.0.0"))),
         advertise_ip=address, port=port("ROUTER_PORT", 30000), launcher_port=port("LAUNCHER_PORT", 30001),
         nat_port=port("NAT_PORT", 30002), http_port=port("HTTP_PORT", 8080),
@@ -79,11 +81,25 @@ async def serve(args) -> None:
     args.private_key = args.state / "router-private.pem"
     accounts.initialize_database(args.account_db)
     ensure_key(args.private_key)
-    # The HTTP endpoint is stateless and exposes only bootstrap/health data.
-    http = SimpleNamespace(bind=args.bind, port=args.http_port, router_ip=args.advertise_ip,
-                           router_port=args.port, launcher_port=args.launcher_port,
-                           nat_ip=args.advertise_ip, nat_port=args.nat_port)
-    tasks = [asyncio.create_task(router.serve(args)), asyncio.create_task(bootstrap.serve(http))]
+    # Accounts, RSA key and resource limits are process-wide. Each game's GS
+    # listeners own its transient handoffs, NAT sessions and room registry.
+    products = {}
+    tasks = []
+    for binding in args.games:
+        profile = binding.profile
+        game_args = SimpleNamespace(**(vars(args) | {
+            "game_profile": profile, "port": binding.router_port,
+            "launcher_port": binding.launcher_port, "nat_port": binding.nat_port}))
+        products[profile.product] = profile.bootstrap(
+            args.advertise_ip, binding.router_port, binding.launcher_port,
+            args.advertise_ip, binding.nat_port)
+        logging.getLogger("ubisoft.service").info(
+            "enabling game=%s product=%s rooms=%s ports=%s", profile.slug,
+            profile.product, profile.supports_rooms,
+            (binding.router_port, binding.launcher_port, binding.nat_port))
+        tasks.append(asyncio.create_task(router.serve(game_args)))
+    http = SimpleNamespace(bind=args.bind, port=args.http_port, products=products)
+    tasks.append(asyncio.create_task(bootstrap.serve(http)))
     try:
         await asyncio.gather(*tasks)
     finally:
@@ -107,7 +123,7 @@ def main() -> None:
         args = configuration()
         asyncio.run(run(args))
     except (KeyError, ValueError) as exc:
-        raise SystemExit("Invalid Tubisoft configuration; set a reachable IPv4 address and valid optional CIDRs.") from exc
+        raise SystemExit("Invalid Tubisoft configuration; check advertised IPv4, CIDRs, game slugs and distinct ports.") from exc
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
 

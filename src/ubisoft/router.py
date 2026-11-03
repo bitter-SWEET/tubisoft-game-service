@@ -18,12 +18,13 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from . import accounts, crypto, data, gsxor, nat, rooms, srp_probe
 from .bootstrap import port_number
 from .frame import GSHeader, HEADER_SIZE, read_frame
-from .games.xiii import player_port
+from .games.base import GameProfile
+from .games.xiii import PROFILE as XIII
 from .access import AccessPolicy
 
 LOG = logging.getLogger("ubisoft.router")
 KEY_EXCHANGE = 0xDB
-PARENT_LOBBY = ["0", "XIII", "1", "1", "0", "0", "1", "", "", "", b"", "0", "8", "0"]
+PARENT_LOBBY = XIII.parent_lobby()  # Compatibility for existing protocol fixtures.
 
 
 def response_header(request: GSHeader, payload: bytes, message_type: int | None = None) -> bytes:
@@ -51,10 +52,11 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                  authenticated: dict[tuple[str, str], float],
                  registry: rooms.RoomRegistry,
                  host_probe: srp_probe.Probe | None = None,
-                 access_policy: AccessPolicy | None = None) -> None:
+                 access_policy: AccessPolicy | None = None,
+                 game_profile: GameProfile = XIII) -> None:
     peer = writer.get_extra_info("peername")
     local = writer.get_extra_info("sockname")
-    LOG.info("connected peer=%s local=%s", peer, local)
+    LOG.info("connected game=%s peer=%s local=%s", game_profile.slug, peer, local)
     game_public: crypto.GSPublicKey | None = None
     client_key: bytes | None = None
     server_key: bytes | None = None
@@ -228,7 +230,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                 and all(isinstance(field, str) for field in fields)):
                             # Launcher callback 0x01d65750 expects a list of
                             # parent group records followed by an implicit end.
-                            groups = [["1", "1", "XIII", "0", "8"]]
+                            groups = game_profile.launcher_groups()
                             payload = gsxor.encrypt(data.encode([b"\xd9", groups]))
                             writer.write(response_header(header, payload, 0x26) + payload)
                             await writer.drain()
@@ -241,7 +243,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                          peer, [type(field).__name__ for field in fields[2]],
                                          [len(field) for field in fields[2] if isinstance(field, bytes)])
                             try:
-                                created_room = registry.register(logged_in_user, peer[0], fields)
+                                created_room = registry.register(logged_in_user, peer[0], fields, game_profile)
                             except ValueError as exc:
                                 LOG.info("registration rejected peer=%s reason=%s", peer, exc)
                                 break
@@ -268,6 +270,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                         elif (header.message_type == 0xd2 and len(fields) >= 2
                               and isinstance(fields[0], str)
                               and isinstance(fields[1], (str, bytes))):
+                            game_profile.require_rooms()
                             key = (peer[0], fields[0].casefold())
                             expiry = pending_handoffs.pop(key, 0)
                             if expiry > time.monotonic():
@@ -275,7 +278,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                     if not isinstance(fields[1], str) or not fields[1].isascii() or not fields[1].isdecimal():
                                         LOG.info("host lobby login rejected peer=%s: invalid room id", peer)
                                         break
-                                    candidate_host_room = registry.activate(int(fields[1]), fields[0].casefold(), peer[0])
+                                    candidate_host_room = registry.activate(int(fields[1]), fields[0].casefold(), peer[0], game_profile.product)
                                     if candidate_host_room is None:
                                         LOG.info("host lobby login rejected peer=%s: room ownership mismatch", peer)
                                         break
@@ -314,15 +317,14 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                               and isinstance(fields[1], list)
                               and fields[0].isascii() and fields[0].isdigit()
                               and len(fields[0]) <= 3):
+                            game_profile.require_rooms()
                             subtype = int(fields[0])
                             LOG.info("lobby request peer=%s subtype=%d", peer, subtype)
                             if subtype == 21:
                                 payload = gsxor.encrypt(data.encode(["38", ["21"]]))
                                 writer.write(response_header(header, payload, 0xd1) + payload)
-                                # Candidate shared GS parent lobby, with no game rooms.
-                                # This record layout comes from a different GS title and
-                                # must be verified with XIII before it is relied upon.
-                                payload = gsxor.encrypt(data.encode(["53", ["1", "256", ["0"], [PARENT_LOBBY]]]))
+                                # The title adapter supplies its tested parent record.
+                                payload = gsxor.encrypt(data.encode(["53", ["1", "256", ["0"], [game_profile.parent_lobby()]]]))
                                 writer.write(response_header(header, payload, 0xd1) + payload)
                                 await writer.drain()
                                 LOG.info("discovery login response and experimental parent lobby sent peer=%s", peer)
@@ -340,10 +342,10 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                 # Group-info notification with the actual local parent
                                 # and no child game rooms; the prior subtype-9 reply
                                 # caused XIII to report that the group did not exist.
-                                payload = gsxor.encrypt(data.encode(["53", ["1", "256", PARENT_LOBBY, registry.children()]]))
+                                payload = gsxor.encrypt(data.encode(["53", ["1", "256", game_profile.parent_lobby(), registry.children(game_profile.product)]]))
                                 writer.write(response_header(header, payload, 0xd1) + payload)
                                 await writer.drain()
-                                LOG.info("lobby group sent peer=%s active_rooms=%d", peer, len(registry.children()))
+                                LOG.info("lobby group sent peer=%s active_rooms=%d", peer, len(registry.children(game_profile.product)))
                                 continue
                             if (subtype == 24 and len(fields[1]) == 5
                                     and all(isinstance(item, str) for item in fields[1])):
@@ -353,7 +355,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                         or not all(value.isascii() and value.isdecimal() for value in values[2:4])):
                                     LOG.info("unsupported room join request peer=%s", peer)
                                     break
-                                room = registry.active_room(int(values[0]))
+                                room = registry.active_room(int(values[0]), game_profile.product)
                                 if room is None:
                                     LOG.info("room join rejected peer=%s: room unavailable", peer)
                                     break
@@ -384,7 +386,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                             if (subtype == 46 and len(fields[1]) == 1
                                     and isinstance(fields[1][0], str)
                                     and fields[1][0].isascii() and fields[1][0].isdecimal()):
-                                room = registry.active_room(int(fields[1][0]))
+                                room = registry.active_room(int(fields[1][0]), game_profile.product)
                                 if room is None:
                                     LOG.info("additional room info unavailable peer=%s", peer)
                                     continue
@@ -400,8 +402,8 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                     break
                                 joined_room.member_info[(peer[0], wait_user.casefold())] = fields[1][0]
                                 is_owner = (peer[0], wait_user.casefold()) == (joined_room.peer_ip, joined_room.owner)
-                                if host_probe is not None and joined_room.product == "XIIIPS2US" and not is_owner:
-                                    guest_port = player_port(fields[1][0])
+                                if host_probe is not None and not is_owner:
+                                    guest_port = joined_room.profile.player_port(fields[1][0])
                                     notified = host_probe.member_info(joined_room, wait_user, peer[0],
                                                                       fields[1][0], new=not host_member_notified)
                                     host_member_notified |= notified
@@ -438,7 +440,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                     joined_room.members.discard((peer[0], wait_user.casefold()))
                                     joined_room.member_info.pop((peer[0], wait_user.casefold()), None)
                                     if host_probe is not None and host_member_notified:
-                                        host_probe.notify_host(joined_room, [["51", [wait_user]]])
+                                        host_probe.notify_host(joined_room, [joined_room.profile.member_left(wait_user)])
                                 host_member_notified = False
                                 payload = gsxor.encrypt(data.encode(["38", ["8", [group_id]]]))
                                 writer.write(response_header(header, payload, 0xd1) + payload)
@@ -452,8 +454,9 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                 continue
                             LOG.info("unsupported lobby request peer=%s subtype=%d nested_types=%s", peer, subtype,
                                      [type(item).__name__ for item in fields[1]])
-                    except ValueError:
-                        LOG.info("plain message peer=%s could not be decoded", peer)
+                    except ValueError as exc:
+                        LOG.info("plain message rejected game=%s peer=%s reason=%s",
+                                 game_profile.slug, peer, type(exc).__name__)
                 LOG.info("unhandled message peer=%s type=0x%02x", peer, header.message_type)
             # Avoid fabricating account creation or login results.
             break
@@ -466,7 +469,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
             joined_room.members.discard((peer[0], wait_user.casefold()))
             joined_room.member_info.pop((peer[0], wait_user.casefold()), None)
             if host_probe is not None and host_member_notified:
-                host_probe.notify_host(joined_room, [["51", [wait_user]]])
+                host_probe.notify_host(joined_room, [joined_room.profile.member_left(wait_user)])
         if host_room is not None:
             removed = registry.unbind_host(host_room, host_connection)
             LOG.info("owner room connection closed peer=%s room=%d removed=%s", peer, host_room.room_id, removed)
@@ -482,7 +485,8 @@ async def serve(args: argparse.Namespace) -> None:
     pending_handoffs: dict[tuple[str, str], float] = {}
     authenticated: dict[tuple[str, str], float] = {}
     registry = rooms.RoomRegistry()
-    host_probe = srp_probe.Probe(pending_handoffs, registry)
+    game_profile = getattr(args, "game_profile", XIII)
+    host_probe = srp_probe.Probe(pending_handoffs, registry, game_profile)
     advertise_ip = getattr(args, "advertise_ip", None) or args.bind
     access_policy = getattr(args, "access_policy", None)
     async def callback(reader, writer):
@@ -493,7 +497,7 @@ async def serve(args: argparse.Namespace) -> None:
             return
         try:
             await handle(reader, writer, key, args.timeout, args.account_db, advertise_ip, args.port,
-                         pending_handoffs, authenticated, registry, host_probe, access_policy)
+                         pending_handoffs, authenticated, registry, host_probe, access_policy, game_profile)
         finally:
             if access_policy is not None:
                 access_policy.release(peer_ip)

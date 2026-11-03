@@ -4,7 +4,9 @@ An experimental Ubisoft Game Services revival for PS2. The name is a play on Tub
 
 Two unmodified **XIII USA** clients (`SLUS-20677`, CRC `FCD97245`) have created accounts, signed in, discovered a room, joined the same LAN match, and played together. NAT discovery, host-side peer-opening notifications, score-list updates, and host-exit room removal have been exercised. This release packages that implementation for an **open beta**. Anyone can create a game account and connect; no tester approval or IP enrollment is required.
 
-The common `ubisoft` package provides GS framing, crypto, accounts, lobby state, and NAT discovery. XIII-specific data codecs live in `ubisoft.games.xiii`. [Ghost Recon 2 research](docs/ghost-recon-2-network.md) confirms shared native GS primitives and identifies the required profile differences; a working GR2 client flow has not yet been established.
+The common `ubisoft` package provides GS framing, crypto, shared SQLite accounts, lobby state, and NAT discovery. Title adapters live in `ubisoft.games`, with isolated per-game listeners and transient sessions. Existing accounts work across enabled games without copying credentials. See the [multi-game architecture and extension guide](docs/multi-game-architecture.md).
+
+XIII remains enabled by default. Ghost Recon 2 has an opt-in development profile for its native bootstrap format and shared authentication experiments; its room creation/join adapter is not implemented. [GR2 research](docs/ghost-recon-2-network.md) records the evidence and remaining work.
 
 ## Run a beta instance
 

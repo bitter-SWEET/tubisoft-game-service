@@ -17,6 +17,8 @@ Copy `.env.example` to the ignored `.env`, set its permissions to 0600, and repl
 
 The Compose image runs as UID/GID 10001 with a read-only root, no added capabilities, a temporary `/tmp`, bounded logs, and persistent `/state`. The service creates `/state/accounts.sqlite3` and `/state/router-private.pem` with private file permissions. Log addresses are replaced by per-process peer IDs; IDs intentionally change on restart. Do not publish raw infrastructure/proxy logs.
 
+`TUBISOFT_GAMES` defaults to `xiii`; enabling other profiles uses the same SQLite/key volume and separate per-game ports. No account migration or duplication is needed. GR2 is currently a development-only profile with room operations unavailable. Use the explicit Compose overlay and instructions in the [multi-game guide](multi-game-architecture.md) for experiments; the default beta deployment exposes only XIII.
+
 There are connection/concurrency and authentication-attempt limits; password hashing is offloaded with a bounded worker semaphore. These do not replace firewall restrictions. UDP host state and the NAT helper are bounded but do not implement every original SDK reliability/error branch.
 
 Docker's published bridge-network ports can bypass ordinary UFW input rules; see [Docker's firewall documentation](https://docs.docker.com/engine/network/packet-filtering-firewalls/#docker-and-ufw). For an optional private deployment, enforce any network allowlist both in the application and at the provider firewall or appropriate Docker-aware forwarding rules. Do not assume an absent UFW allow rule makes a published port private, and do not disable Docker's own firewall management to work around this.

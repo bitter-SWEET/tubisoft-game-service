@@ -17,12 +17,13 @@ jobs:
       - run: python tools/publication_audit.py --git
       - run: python -W error::ResourceWarning -m unittest discover -s tests -v
       - run: docker compose --env-file .env.example config --quiet
+      - run: docker compose -f compose.yaml -f deploy/compose.gr2.yaml --env-file .env.example config --quiet
       - run: docker compose --env-file .env.example build
       - name: Start the actual Compose service
         shell: bash
         run: |
           set -euo pipefail
-          compose=(docker compose --project-name tubisoft-ci --env-file .env.example)
+          compose=(docker compose -f compose.yaml -f deploy/compose.gr2.yaml --project-name tubisoft-ci --env-file .env.example)
           trap 'docker rm -f tubisoft-ci-smoke >/dev/null 2>&1 || true; "${compose[@]}" down --volumes' EXIT
           "${compose[@]}" run --no-deps -d --name tubisoft-ci-smoke game-service
           docker exec -i tubisoft-ci-smoke python - <<'PY'
@@ -39,5 +40,9 @@ jobs:
                   time.sleep(1)
           with urllib.request.urlopen('http://127.0.0.1:8080/gsinit.php?dp=XIIIPS2US', timeout=2) as response:
               assert b'192.0.2.10' in response.read()
+          with urllib.request.urlopen('http://127.0.0.1:8080/gsinit.php?dp=GHOSTRECON2PS2', timeout=2) as response:
+              body = response.read()
+              assert body.startswith(b'[Servers]\r\n')
+              assert b'RouterPort0=30010\r\n' in body
           print('Compose startup and bootstrap passed.')
           PY

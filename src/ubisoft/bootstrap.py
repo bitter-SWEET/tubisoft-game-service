@@ -1,13 +1,14 @@
-"""Minimal gsinit bootstrap responder based on the XIII USA PS2 client.
-
-This only provides service addresses. It does not implement a Ubisoft router.
-"""
+"""Product-dispatched gsinit bootstrap; title adapters supply the INI dialect."""
 from __future__ import annotations
 
 import argparse
 import asyncio
 import ipaddress
 import logging
+from collections.abc import Mapping
+
+from .games.base import GameProfile
+from .games.xiii import PROFILE as XIII
 from urllib.parse import urlsplit, parse_qs
 
 LOG = logging.getLogger("ubisoft.bootstrap")
@@ -37,15 +38,13 @@ def response(body: bytes, status: bytes = b"200 OK") -> bytes:
 
 
 def bootstrap_body(router_ip: str, router_port: int, launcher_port: int,
-                   nat_ip: str | None, nat_port: int | None) -> bytes:
-    lines = [f"routerip0={router_ip}", f"routerport0={router_port}",
-             f"routerlauncherport0={launcher_port}"]
-    if nat_ip is not None and nat_port is not None:
-        lines.extend((f"natserverip0={nat_ip}", f"natserverport0={nat_port}"))
-    return ("\r\n".join(lines) + "\r\n").encode("ascii")
+                   nat_ip: str | None, nat_port: int | None,
+                   profile: GameProfile = XIII) -> bytes:
+    return profile.bootstrap(router_ip, router_port, launcher_port, nat_ip, nat_port)
 
 
-async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, body: bytes) -> None:
+async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, body: bytes | Mapping[str, bytes]) -> None:
+    products = {XIII.product: body} if isinstance(body, bytes) else body
     try:
         request = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10)
         if len(request) > MAX_REQUEST:
@@ -55,13 +54,14 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, bod
             result = response(b"Bad request\r\n", b"400 Bad Request")
         else:
             target = urlsplit(first_line[1].decode("ascii"))
+            product = parse_qs(target.query).get("dp", [])
             if target.path == "/healthz":
                 result = response(b"ok\n")
-            elif target.path != "/gsinit.php" or parse_qs(target.query).get("dp") != ["XIIIPS2US"]:
+            elif target.path != "/gsinit.php" or len(product) != 1 or product[0] not in products:
                 result = response(b"Not found\r\n", b"404 Not Found")
             else:
                 LOG.info("served gsinit request from %s", writer.get_extra_info("peername"))
-                result = response(body)
+                result = response(products[product[0]])
         writer.write(result)
         await writer.drain()
     except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError,
@@ -76,7 +76,9 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, bod
 
 
 async def serve(args: argparse.Namespace) -> None:
-    body = bootstrap_body(args.router_ip, args.router_port, args.launcher_port, args.nat_ip, args.nat_port)
+    body = getattr(args, "products", None)
+    if body is None:
+        body = bootstrap_body(args.router_ip, args.router_port, args.launcher_port, args.nat_ip, args.nat_port)
     server = await asyncio.start_server(lambda r, w: handle(r, w, body), args.bind, args.port, limit=MAX_REQUEST)
     LOG.info("bootstrap listening on %s", ", ".join(str(s.getsockname()) for s in server.sockets or []))
     async with server:

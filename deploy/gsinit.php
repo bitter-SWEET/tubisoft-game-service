@@ -1,17 +1,24 @@
 <?php
-// XIII local lab entry point. Port 80 belongs to the existing Apache service.
-// Keep this response in sync with compose.yaml's bootstrap configuration.
-if (($_GET['dp'] ?? '') !== 'XIIIPS2US') {
+// Optional Apache/PHP bridge to the canonical Python bootstrap dispatcher.
+// Product formats and enabled titles live only in the application profiles.
+$product = $_GET['dp'] ?? '';
+if (!is_string($product) || !preg_match('/^[A-Z0-9]{1,64}$/D', $product)) {
     http_response_code(404);
     header('Connection: close');
     exit;
 }
-$ip = getenv('TUBISOFT_ADVERTISE_IP');
-if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) || $ip === '0.0.0.0') {
+$context = stream_context_create(['http' => ['timeout' => 3, 'ignore_errors' => true,
+    'follow_location' => 0, 'header' => "Connection: close\r\n"]]);
+$body = @file_get_contents('http://127.0.0.1:18080/gsinit.php?dp=' . rawurlencode($product), false, $context);
+if ($body === false || !isset($http_response_header[0])) {
     http_response_code(503);
     exit;
 }
-$body = "routerip0=$ip\r\nrouterport0=30000\r\nrouterlauncherport0=30001\r\nnatserverip0=$ip\r\nnatserverport0=30002\r\n";
+if (!preg_match('/^HTTP\/\S+ (\d{3})/', $http_response_header[0], $status)) {
+    http_response_code(503);
+    exit;
+}
+http_response_code((int)$status[1]);
 header('Content-Type: text/plain');
 header('Content-Length: ' . strlen($body));
 header('Connection: close');

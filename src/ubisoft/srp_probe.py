@@ -6,6 +6,9 @@ See https://github.com/michal-kapala/ubi-gs/blob/master/srp.py.
 """
 from __future__ import annotations
 
+from .games.base import GameProfile
+from .games.xiii import PROFILE as XIII
+
 import asyncio
 import logging
 import struct
@@ -77,9 +80,10 @@ class Session:
 
 
 class Probe(asyncio.DatagramProtocol):
-    def __init__(self, pending_handoffs: dict[tuple[str, str], float], registry: rooms.RoomRegistry):
+    def __init__(self, pending_handoffs: dict[tuple[str, str], float], registry: rooms.RoomRegistry, profile: GameProfile = XIII):
         self.pending_handoffs = pending_handoffs
         self.registry = registry
+        self.profile = profile
         self.transport: asyncio.DatagramTransport | None = None
         self.sessions: dict[tuple[str, int], Session] = {}
         self.cleanup: asyncio.TimerHandle | None = None
@@ -153,6 +157,8 @@ class Probe(asyncio.DatagramProtocol):
 
     def notify_host(self, room: rooms.Room, events: list[list]) -> bool:
         """Send ordered GS events on the owning host's reliable UDP channel."""
+        if room.product != self.profile.product:
+            return False
         for peer, session in self.sessions.items():
             if session.room is not room or self.registry.active_room(room.room_id) is not room:
                 continue
@@ -180,14 +186,7 @@ class Probe(asyncio.DatagramProtocol):
     def member_info(self, room: rooms.Room, username: str, ip: str, info: bytes, *, new: bool) -> bool:
         if (ip, username.casefold()) == (room.peer_ip, room.owner):
             return False
-        events = []
-        if new:
-            # 0x01d66be0 reads indices 0,1,3,4,5,6; index 2 is unused.
-            events.append(["50", [username, "0", str(room.room_id), ip, "", b"", "0"]])
-        # Keep this game payload opaque. XIII's 0x00383b00 consumes the first
-        # native u32 as a port and sends NAT\0 after the member address exists.
-        events.append(["66", [username, info]])
-        return self.notify_host(room, events)
+        return self.notify_host(room, room.profile.member_events(room, username, ip, info, new=new))
 
     def send_ack(self, peer: tuple[str, int], session: Session, segment: int) -> None:
         # XIII's 0x01d52140 constructs this pure-ACK form: empty body,
@@ -200,31 +199,9 @@ class Probe(asyncio.DatagramProtocol):
             self.transport.sendto(packet, peer)
 
     def host_operation(self, session: Session, fields: list) -> list | None:
-        """Handle the host operations whose XIII constructors have been traced.
-
-        The response shape follows XIII's callbacks, but is not yet verified
-        against a live match. Unknown updates are left for further research.
-        """
-        room = session.room
-        if (room is None or not room.active or len(fields) != 2
-                or not isinstance(fields[0], str) or not isinstance(fields[1], list)):
+        if session.room is None or session.room.product != self.profile.product:
             return None
-        subtype, values = fields
-        if not values or values[0] != str(room.room_id):
-            return None
-        if subtype == "17" and len(values) == 2 and isinstance(values[1], str):
-            if not values[1].isascii() or not values[1].isdecimal():
-                return None
-        elif subtype == "45" and len(values) == 1:
-            pass
-        elif (subtype == "31" and len(values) == 3 and values[1] == "1024"
-              and isinstance(values[2], bytes) and len(values[2]) <= 16384):
-            # XIII's UpdateMyGameServer caller selects mask 0x400 for the
-            # AdditionalInfo payload containing the player/score list.
-            room.additional_info = values[2]
-        else:
-            return None
-        return [subtype, [str(room.room_id)]]
+        return session.room.profile.host_operation(session.room, fields)
 
     def datagram_received(self, packet: bytes, peer: tuple[str, int]) -> None:
         session = self.sessions.get(peer)
@@ -289,7 +266,7 @@ class Probe(asyncio.DatagramProtocol):
                         if self.pending_handoffs.get(key, 0) <= time.monotonic():
                             LOG.info("UDP host login rejected peer=%s: no pending handoff", peer)
                             return
-                        room = self.registry.activate(int(fields[1]), owner, peer[0])
+                        room = self.registry.activate(int(fields[1]), owner, peer[0], self.profile.product)
                         if room is None:
                             LOG.info("UDP host login rejected peer=%s: room ownership mismatch", peer)
                             return
