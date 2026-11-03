@@ -37,6 +37,21 @@ def checksum(packet: bytes) -> int:
     return (~total) & 0xffff
 
 
+def finish_datagram(packet: bytes) -> bytes:
+    """Pad outside the declared payload before checksumming for the PS2 EE.
+
+    The retail checksum's odd-length branch advances its pointer by one,
+    then executes LHU at 0x01d520f4. With an aligned receive buffer this is
+    an unaligned load. The receiver copies only the header's declared data
+    length (0x01d52dd0), so an external zero byte preserves the GS message.
+    """
+    if len(packet) < HEADER.size:
+        raise ValueError("SRP datagram is shorter than its header")
+    if len(packet) & 1:
+        packet += b"\0"
+    return struct.pack("<H", checksum(packet)) + packet[2:]
+
+
 def syn_reply(packet: bytes) -> bytes:
     if len(packet) != HEADER.size + WINDOW.size:
         raise ValueError("unsupported SYN size")
@@ -46,7 +61,7 @@ def syn_reply(packet: bytes) -> bytes:
     _, sender_signature, seed, _ = WINDOW.unpack_from(packet, HEADER.size)
     body = WINDOW.pack(10, 2, 0, 0x218)
     reply = HEADER.pack(seed, sender_signature, len(body), IDENT | SYN | ACK, 0, segment) + body
-    return struct.pack("<H", checksum(reply)) + reply[2:]
+    return finish_datagram(reply)
 
 
 @dataclass
@@ -104,7 +119,7 @@ class Probe(asyncio.DatagramProtocol):
             return  # A retried request can resume once the ring slot is ACKed.
         packet = HEADER.pack(session.seed, session.signature, len(frame), IDENT | ACK,
                              session.next_segment, ack) + frame
-        packet = struct.pack("<H", checksum(packet)) + packet[2:]
+        packet = finish_datagram(packet)
         session.next_segment = (session.next_segment + 1) % SEQUENCE_MODULUS
         session.last_segment = ack
         session.last_reply = packet
@@ -142,7 +157,7 @@ class Probe(asyncio.DatagramProtocol):
             sequence = session.next_segment
             packet = HEADER.pack(session.seed, session.signature, len(frames), IDENT,
                                  sequence, 0xffff) + frames
-            packet = struct.pack("<H", checksum(packet)) + packet[2:]
+            packet = finish_datagram(packet)
             session.next_segment = (sequence + 1) % SEQUENCE_MODULUS
             session.notifications[sequence] = (packet, 1, time.monotonic())
             if self.transport is not None:
@@ -170,7 +185,7 @@ class Probe(asyncio.DatagramProtocol):
         # Control ACKs do not consume a server data sequence or replace the
         # cached GS reply needed when a data segment is retransmitted.
         packet = HEADER.pack(session.seed, session.signature, 0, IDENT | ACK, 0xffff, segment)
-        packet = struct.pack("<H", checksum(packet)) + packet[2:]
+        packet = finish_datagram(packet)
         if self.transport is not None:
             self.transport.sendto(packet, peer)
 

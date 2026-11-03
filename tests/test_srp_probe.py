@@ -5,10 +5,24 @@ import unittest
 from ubisoft import data, gsxor
 from ubisoft.frame import GSHeader, HEADER_SIZE
 from ubisoft.rooms import RoomRegistry
-from ubisoft.srp_probe import HEADER, WINDOW, ACK, FIN, IDENT, SYN, Probe, Session, checksum, syn_reply
+from ubisoft.srp_probe import HEADER, WINDOW, ACK, FIN, IDENT, SYN, Probe, Session, checksum, finish_datagram, syn_reply
 
 
 class SynProbeTests(unittest.TestCase):
+    def test_outbound_datagrams_keep_checksum_loads_aligned_without_delivering_padding_as_data(self):
+        for seed in (0, 0x80, 0x8080, 0xffff):
+            for length in range(1, 18):
+                with self.subTest(seed=seed, length=length):
+                    payload = bytes(range(length))
+                    original = HEADER.pack(seed, 0x1234, length, IDENT | ACK, 1, 0) + payload
+                    packet = finish_datagram(original)
+                    self.assertEqual(len(packet) % 2, 0)
+                    self.assertEqual(HEADER.unpack_from(packet)[1:], HEADER.unpack_from(original)[1:])
+                    declared = HEADER.unpack_from(packet)[2]
+                    self.assertEqual(packet[HEADER.size:HEADER.size + declared], payload)
+                    self.assertEqual(packet[HEADER.size + declared:], b"\0" if length & 1 else b"")
+                    self.assertEqual(HEADER.unpack_from(packet)[0], checksum(seed.to_bytes(2, "little") + packet[2:]))
+
     def test_checksum_matches_signed_byte_and_32_bit_folding_in_client(self):
         # MIPS lb at 0x01d520d8 sign-extends the odd leading byte;
         # addu then srl implement 32-bit wrap and unsigned folding.
@@ -135,7 +149,7 @@ class DatagramFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(checksum(response), 0)
         response_header = GSHeader.decode(response[HEADER.size:HEADER.size + HEADER_SIZE])
         self.assertEqual(response_header.message_type, 0x26)
-        self.assertEqual(data.decode(gsxor.decrypt(response[HEADER.size + HEADER_SIZE:])),
+        self.assertEqual(data.decode(gsxor.decrypt(response[HEADER.size + HEADER_SIZE:HEADER.size + response_header.size])),
                          ["210", ["1", str(room.room_id)]])
         self.assertEqual(len(registry.children()), 1)
         probe.datagram_received(HEADER.pack(0, 0, 0, IDENT | FIN, 1, 1), peer)
@@ -169,7 +183,7 @@ class DatagramFlowTests(unittest.IsolatedAsyncioTestCase):
             response = transport.sent[-1][0]
             header = GSHeader.decode(response[HEADER.size:HEADER.size + HEADER_SIZE])
             self.assertEqual(header.message_type, 0x26)
-            self.assertEqual(data.decode(gsxor.decrypt(response[HEADER.size + HEADER_SIZE:])),
+            self.assertEqual(data.decode(gsxor.decrypt(response[HEADER.size + HEADER_SIZE:HEADER.size + header.size])),
                              [subtype, [str(room.room_id)]])
             self.assertEqual(checksum(response), 0)
             count = len(transport.sent)

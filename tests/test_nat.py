@@ -28,7 +28,7 @@ def control_request(request_id="7", segment=0):
 
 def fields(packet):
     header = GSHeader.decode(packet[HEADER.size:HEADER.size + HEADER_SIZE])
-    return header, data.decode(gsxor.decrypt(packet[HEADER.size + HEADER_SIZE:]))
+    return header, data.decode(gsxor.decrypt(packet[HEADER.size + HEADER_SIZE:HEADER.size + header.size]))
 
 
 def checksum_valid(packet):
@@ -50,6 +50,24 @@ class NatTests(unittest.IsolatedAsyncioTestCase):
     def handshake(self, helper, peer):
         helper.datagram_received(HEADER.pack(0, 0, 8, IDENT | SYN, 0, 0)
                                  + WINDOW.pack(10, 0x1234, 0, 536), peer)
+
+    async def test_odd_sized_nat_reply_is_aligned_without_changing_its_token_or_declared_length(self):
+        helper, transport = self.start()
+        peer = ("192.0.2.2", 1026)
+        self.handshake(helper, peer)
+        token = b"\xde\xad\xbe\xef"
+        with patch("ubisoft.nat.secrets.token_bytes", return_value=token):
+            helper.datagram_received(control_request(), peer)
+        packet = transport.sent[-1][0]
+        header, body = fields(packet)
+        self.assertEqual(HEADER.unpack_from(packet)[2], header.size)
+        self.assertEqual(HEADER.size + header.size, 45)
+        self.assertEqual(len(packet), 46)
+        self.assertEqual(packet[-1:], b"\0")
+        self.assertEqual(body, ["2", ["7", str(int.from_bytes(token, "big")), "30002"]])
+        self.assertTrue(checksum_valid(packet))
+        helper.datagram_received(token, (peer[0], 7777))
+        self.assertEqual(len(transport.sent[-1][0]) % 2, 0)
 
     async def test_lost_port_and_address_replies_are_retried_identically_until_acknowledged(self):
         helper, transport = self.start()

@@ -11,13 +11,12 @@ from dataclasses import dataclass, field
 import ipaddress
 import logging
 import secrets
-import struct
 import time
 
 from . import data, gsxor
 from .frame import GSHeader, HEADER_SIZE
 from .access import networks
-from .srp_probe import HEADER, WINDOW, ACK, FIN, IDENT, SYN, SEQUENCE_MODULUS, checksum, syn_reply
+from .srp_probe import HEADER, WINDOW, ACK, FIN, IDENT, SYN, SEQUENCE_MODULUS, finish_datagram, syn_reply
 
 LOG = logging.getLogger("ubisoft.nat")
 SESSION_SECONDS = 300
@@ -140,7 +139,7 @@ class Discovery(asyncio.DatagramProtocol):
         session.next_sequence = (sequence + 1) % SEQUENCE_MODULUS
         packet = HEADER.pack(session.seed, session.signature, len(frame), IDENT | ACK,
                              sequence, request.segment) + frame
-        packet = struct.pack("<H", checksum(packet)) + packet[2:]
+        packet = finish_datagram(packet)
         session.replies.setdefault(request.segment, []).append(packet)
         LOG.info("NAT control reply sent peer=%s subtype=%s request=%s bytes=%d sequence=%d ack=%d",
                  request.peer, subtype, request.request_id, len(packet), sequence, request.segment)
@@ -219,7 +218,7 @@ class Discovery(asyncio.DatagramProtocol):
         if size == 0:
             if not flags & ACK:
                 response = HEADER.pack(session.seed, session.signature, 0, IDENT | ACK, 0xffff, segment)
-                self.send(struct.pack("<H", checksum(response)) + response[2:], peer)
+                self.send(finish_datagram(response), peer)
             return
         if segment in session.replies:
             for response in session.replies[segment]:

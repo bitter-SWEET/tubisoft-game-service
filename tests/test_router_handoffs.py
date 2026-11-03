@@ -233,7 +233,9 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         events = []
         for packet, _ in host_packets:
             offset = srp_probe.HEADER.size
-            while offset < len(packet):
+            payload_end = offset + srp_probe.HEADER.unpack_from(packet)[2]
+            self.assertEqual(len(packet) % 2, 0)
+            while offset < payload_end:
                 header = GSHeader.decode(packet[offset:offset + HEADER_SIZE])
                 self.assertEqual((header.message_type, header.sender, header.receiver), (0xd1, 2, 4))
                 events.append(data.decode(gsxor.decrypt(packet[offset + HEADER_SIZE:offset + header.size])))
