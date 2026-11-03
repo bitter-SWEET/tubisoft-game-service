@@ -31,6 +31,8 @@ class Request:
     token: bytes
     segment: int
     header: GSHeader
+    port_sequence: int | None = None
+    port_acknowledged: bool = False
     address_reply: bytes | None = None
     address_sequence: int | None = None
     acknowledged: bool = False
@@ -68,9 +70,13 @@ class Discovery(asyncio.DatagramProtocol):
         self.sessions.clear()
         self.tokens.clear()
 
-    def remove(self, peer: tuple[str, int]) -> None:
+    def remove(self, peer: tuple[str, int], *, reason: str = "closed") -> None:
         session = self.sessions.pop(peer, None)
         if session is not None:
+            requests = list(session.requests.values())
+            LOG.info("NAT control session ended peer=%s reason=%s requests=%d port_acks=%d game_endpoints=%d address_acks=%d",
+                     peer, reason, len(requests), sum(r.port_acknowledged for r in requests),
+                     sum(r.address_reply is not None for r in requests), sum(r.acknowledged for r in requests))
             for request in session.requests.values():
                 self.tokens.pop(request.token, None)
 
@@ -78,7 +84,7 @@ class Discovery(asyncio.DatagramProtocol):
         now = time.monotonic()
         for peer, session in list(self.sessions.items()):
             if now - session.last_seen > SESSION_SECONDS:
-                self.remove(peer)
+                self.remove(peer, reason="idle-timeout")
         self.cleanup = asyncio.get_running_loop().call_later(30, self.expire)
 
     def send(self, packet: bytes, peer: tuple[str, int]) -> None:
@@ -96,6 +102,8 @@ class Discovery(asyncio.DatagramProtocol):
                              sequence, request.segment) + frame
         packet = struct.pack("<H", checksum(packet)) + packet[2:]
         session.replies.setdefault(request.segment, []).append(packet)
+        LOG.info("NAT control reply sent peer=%s subtype=%s request=%s bytes=%d sequence=%d ack=%d",
+                 request.peer, subtype, request.request_id, len(packet), sequence, request.segment)
         return sequence, packet
 
     def probe(self, packet: bytes, peer: tuple[str, int]) -> None:
@@ -136,7 +144,7 @@ class Discovery(asyncio.DatagramProtocol):
         if flags & IDENT != IDENT or size > len(packet) - HEADER.size:
             return
         if flags & FIN:
-            self.remove(peer)
+            self.remove(peer, reason="peer-fin")
             return
         if flags & SYN:
             if peer not in self.sessions and len(self.sessions) >= MAX_SESSIONS:
@@ -145,7 +153,7 @@ class Discovery(asyncio.DatagramProtocol):
                 response = syn_reply(packet)
             except ValueError:
                 return
-            self.remove(peer)
+            self.remove(peer, reason="new-handshake")
             _, signature, seed, _ = WINDOW.unpack_from(packet, HEADER.size)
             self.sessions[peer] = Session(signature, seed, time.monotonic())
             self.send(response, peer)
@@ -161,8 +169,12 @@ class Discovery(asyncio.DatagramProtocol):
         session.last_seen = time.monotonic()
         if flags & ACK:
             for request in session.requests.values():
-                if request.address_sequence == ack:
+                if request.port_sequence == ack and not request.port_acknowledged:
+                    request.port_acknowledged = True
+                    LOG.info("NAT port reply acknowledged peer=%s request=%s sequence=%d", peer, request.request_id, ack)
+                if request.address_sequence == ack and not request.acknowledged:
                     request.acknowledged = True
+                    LOG.info("NAT address reply acknowledged peer=%s request=%s sequence=%d", peer, request.request_id, ack)
         if size == 0:
             if not flags & ACK:
                 response = HEADER.pack(session.seed, session.signature, 0, IDENT | ACK, 0xffff, segment)
@@ -200,6 +212,7 @@ class Discovery(asyncio.DatagramProtocol):
         self.tokens[token] = request
         # 0x01d8ef90 converts this value to network bytes and asks the game
         # socket to send those four bytes to the advertised NAT service port.
-        _, response = self.reply(session, request, "2", int.from_bytes(token, "big"), self.port)
+        sequence, response = self.reply(session, request, "2", int.from_bytes(token, "big"), self.port)
+        request.port_sequence = sequence
         self.send(response, peer)
         LOG.info("NAT game-socket probe requested peer=%s request=%s", peer, request_id)

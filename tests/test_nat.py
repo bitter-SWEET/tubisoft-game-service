@@ -1,6 +1,7 @@
 import ipaddress
 import time
 import unittest
+from unittest.mock import patch
 
 from ubisoft import data, gsxor
 from ubisoft.frame import GSHeader, HEADER_SIZE
@@ -49,6 +50,31 @@ class NatTests(unittest.IsolatedAsyncioTestCase):
     def handshake(self, helper, peer):
         helper.datagram_received(HEADER.pack(0, 0, 8, IDENT | SYN, 0, 0)
                                  + WINDOW.pack(10, 0x1234, 0, 536), peer)
+
+    async def test_diagnostics_distinguish_unacknowledged_and_completed_lookups_without_logging_tokens(self):
+        helper, transport = self.start()
+        peer = ("192.0.2.2", 1026)
+        token = b"\xde\xad\xbe\xef"
+        with self.assertLogs("ubisoft.nat", level="INFO") as captured, patch("ubisoft.nat.secrets.token_bytes", return_value=token):
+            self.handshake(helper, peer)
+            helper.datagram_received(control_request(), peer)
+            helper.remove(peer, reason="idle-timeout")
+            self.handshake(helper, peer)
+            helper.datagram_received(control_request(), peer)
+            sequence = HEADER.unpack_from(transport.sent[-1][0])[4]
+            helper.datagram_received(HEADER.pack(0, 0x1234, 0, IDENT | ACK, 0xffff, sequence), peer)
+            helper.datagram_received(token, (peer[0], 7777))
+            sequence = HEADER.unpack_from(transport.sent[-1][0])[4]
+            helper.datagram_received(HEADER.pack(0, 0x1234, 0, IDENT | ACK, 0xffff, sequence), peer)
+            helper.remove(peer)
+        log = "\n".join(captured.output)
+        self.assertIn("subtype=2 request=7", log)
+        self.assertIn("port_acks=0 game_endpoints=0 address_acks=0", log)
+        self.assertIn("NAT port reply acknowledged", log)
+        self.assertIn("NAT address reply acknowledged", log)
+        self.assertIn("port_acks=1 game_endpoints=1 address_acks=1", log)
+        for private_value in (repr(token), token.hex(), str(int.from_bytes(token, "big"))):
+            self.assertNotIn(private_value, log)
 
     async def test_reports_game_socket_endpoint_only_after_its_correlated_probe(self):
         helper, transport = self.start()
