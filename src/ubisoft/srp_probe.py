@@ -1,0 +1,291 @@
+"""Experimental bounded GS UDP handshake probe.
+
+The 12-byte header and SYN response are comparison-based candidates, not a
+verified implementation of XIII's complete reliable datagram transport.
+See https://github.com/michal-kapala/ubi-gs/blob/master/srp.py.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import struct
+import time
+from dataclasses import dataclass, field
+
+from . import data, gsxor, rooms
+from .frame import GSHeader, HEADER_SIZE
+
+LOG = logging.getLogger("ubisoft.srp_probe")
+HEADER = struct.Struct("<6H")
+WINDOW = struct.Struct("<4H")
+SYN, ACK, FIN, IDENT = 2, 4, 1, 0x3040
+# The client may be quiet while a match loads. This is still only a fallback;
+# proper room liveness must be confirmed from update/heartbeat behavior.
+ACTIVE_IDLE_SECONDS = 900
+SEQUENCE_MODULUS = 20  # 0x01d52ee0 doubles the advertised ten-packet window.
+
+
+def checksum(packet: bytes) -> int:
+    """Match 0x01d520a0, including its signed first byte on odd packets."""
+    total = int.from_bytes(packet[:1], "little", signed=True) if len(packet) & 1 else 0
+    start = len(packet) & 1
+    for index in range(start, len(packet), 2):
+        total += int.from_bytes(packet[index:index + 2], "little")
+    total &= 0xffffffff
+    total = (total & 0xffff) + (total >> 16)
+    total += total >> 16
+    return (~total) & 0xffff
+
+
+def syn_reply(packet: bytes) -> bytes:
+    if len(packet) != HEADER.size + WINDOW.size:
+        raise ValueError("unsupported SYN size")
+    _, _, size, flags, segment, _ = HEADER.unpack_from(packet)
+    if size != WINDOW.size or flags & (SYN | IDENT) != (SYN | IDENT):
+        raise ValueError("not a supported SYN")
+    _, sender_signature, seed, _ = WINDOW.unpack_from(packet, HEADER.size)
+    body = WINDOW.pack(10, 2, 0, 0x218)
+    reply = HEADER.pack(seed, sender_signature, len(body), IDENT | SYN | ACK, 0, segment) + body
+    return struct.pack("<H", checksum(reply)) + reply[2:]
+
+
+@dataclass
+class Session:
+    signature: int
+    seed: int
+    next_segment: int = 1
+    last_segment: int | None = None
+    last_reply: bytes | None = None
+    last_seen: float = 0
+    room: rooms.Room | None = None
+    notifications: dict[int, tuple[bytes, int, float]] = field(default_factory=dict)
+
+
+class Probe(asyncio.DatagramProtocol):
+    def __init__(self, pending_handoffs: dict[tuple[str, str], float], registry: rooms.RoomRegistry):
+        self.pending_handoffs = pending_handoffs
+        self.registry = registry
+        self.transport: asyncio.DatagramTransport | None = None
+        self.sessions: dict[tuple[str, int], Session] = {}
+        self.cleanup: asyncio.TimerHandle | None = None
+        self.retries: asyncio.TimerHandle | None = None
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport  # type: ignore[assignment]
+        LOG.info("experimental UDP probe listening at %s", transport.get_extra_info("sockname"))
+        self.cleanup = asyncio.get_running_loop().call_later(30, self.expire_sessions)
+        self.retries = asyncio.get_running_loop().call_later(1, self.retry_notifications)
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        if self.cleanup is not None:
+            self.cleanup.cancel()
+        if self.retries is not None:
+            self.retries.cancel()
+        for peer in list(self.sessions):
+            self.remove_session(peer)
+
+    def remove_session(self, peer: tuple[str, int]) -> None:
+        session = self.sessions.pop(peer, None)
+        if session is not None and session.room is not None:
+            room = session.room
+            self.registry.remove(room.room_id, room.owner, room.peer_ip)
+            LOG.info("UDP host session ended; room removed id=%d", room.room_id)
+
+    def expire_sessions(self) -> None:
+        now = time.monotonic()
+        self.registry.expire_pending(now)
+        for peer, session in list(self.sessions.items()):
+            if now - session.last_seen > ACTIVE_IDLE_SECONDS:
+                self.remove_session(peer)
+        self.cleanup = asyncio.get_running_loop().call_later(30, self.expire_sessions)
+
+    def send_message(self, peer: tuple[str, int], session: Session, ack: int, frame: bytes) -> None:
+        if session.next_segment in session.notifications:
+            return  # A retried request can resume once the ring slot is ACKed.
+        packet = HEADER.pack(session.seed, session.signature, len(frame), IDENT | ACK,
+                             session.next_segment, ack) + frame
+        packet = struct.pack("<H", checksum(packet)) + packet[2:]
+        session.next_segment = (session.next_segment + 1) % SEQUENCE_MODULUS
+        session.last_segment = ack
+        session.last_reply = packet
+        if self.transport is not None:
+            self.transport.sendto(packet, peer)
+
+    def retry_notifications(self) -> None:
+        now = time.monotonic()
+        for peer, session in list(self.sessions.items()):
+            for sequence, (packet, attempts, sent_at) in list(session.notifications.items()):
+                if now - sent_at < 1:
+                    continue
+                if attempts >= 8:
+                    session.notifications.pop(sequence, None)
+                    LOG.info("UDP host notification expired peer=%s sequence=%d", peer, sequence)
+                    continue
+                if self.transport is not None:
+                    self.transport.sendto(packet, peer)
+                session.notifications[sequence] = (packet, attempts + 1, now)
+        self.retries = asyncio.get_running_loop().call_later(1, self.retry_notifications)
+
+    def notify_host(self, room: rooms.Room, events: list[list]) -> bool:
+        """Send ordered GS events on the owning host's reliable UDP channel."""
+        for peer, session in self.sessions.items():
+            if session.room is not room or self.registry.active_room(room.room_id) is not room:
+                continue
+            frames = bytearray()
+            for event in events:
+                payload = gsxor.encrypt(data.encode(event))
+                frames.extend(GSHeader(HEADER_SIZE + len(payload), 0, 1, 0xd1, 2, 4).encode())
+                frames.extend(payload)
+            # Fragmentation is not implemented; never send oversized GS data.
+            if len(frames) > 536 or session.next_segment in session.notifications:
+                return False
+            sequence = session.next_segment
+            packet = HEADER.pack(session.seed, session.signature, len(frames), IDENT,
+                                 sequence, 0xffff) + frames
+            packet = struct.pack("<H", checksum(packet)) + packet[2:]
+            session.next_segment = (sequence + 1) % SEQUENCE_MODULUS
+            session.notifications[sequence] = (packet, 1, time.monotonic())
+            if self.transport is not None:
+                self.transport.sendto(packet, peer)
+            LOG.info("UDP host notifications sent peer=%s room=%d subtypes=%s sequence=%d",
+                     peer, room.room_id, [event[0] for event in events], sequence)
+            return True
+        return False
+
+    def member_info(self, room: rooms.Room, username: str, ip: str, info: bytes, *, new: bool) -> bool:
+        if (ip, username.casefold()) == (room.peer_ip, room.owner):
+            return False
+        events = []
+        if new:
+            # 0x01d66be0 reads indices 0,1,3,4,5,6; index 2 is unused.
+            events.append(["50", [username, "0", str(room.room_id), ip, "", b"", "0"]])
+        # Keep this game payload opaque. XIII's 0x00383b00 consumes the first
+        # native u32 as a port and sends NAT\0 after the member address exists.
+        events.append(["66", [username, info]])
+        return self.notify_host(room, events)
+
+    def send_ack(self, peer: tuple[str, int], session: Session, segment: int) -> None:
+        # XIII's 0x01d52140 constructs this pure-ACK form: empty body,
+        # flags 0x3044, sequence 0xffff, acknowledged peer sequence at +10.
+        # Control ACKs do not consume a server data sequence or replace the
+        # cached GS reply needed when a data segment is retransmitted.
+        packet = HEADER.pack(session.seed, session.signature, 0, IDENT | ACK, 0xffff, segment)
+        packet = struct.pack("<H", checksum(packet)) + packet[2:]
+        if self.transport is not None:
+            self.transport.sendto(packet, peer)
+
+    def host_operation(self, session: Session, fields: list) -> list | None:
+        """Handle the host operations whose XIII constructors have been traced.
+
+        The response shape follows XIII's callbacks, but is not yet verified
+        against a live match. Unknown updates are left for further research.
+        """
+        room = session.room
+        if (room is None or not room.active or len(fields) != 2
+                or not isinstance(fields[0], str) or not isinstance(fields[1], list)):
+            return None
+        subtype, values = fields
+        if not values or values[0] != str(room.room_id):
+            return None
+        if subtype == "17" and len(values) == 2 and isinstance(values[1], str):
+            if not values[1].isascii() or not values[1].isdecimal():
+                return None
+        elif subtype == "45" and len(values) == 1:
+            pass
+        elif (subtype == "31" and len(values) == 3 and values[1] == "1024"
+              and isinstance(values[2], bytes) and len(values[2]) <= 16384):
+            # XIII's UpdateMyGameServer caller selects mask 0x400 for the
+            # AdditionalInfo payload containing the player/score list.
+            room.additional_info = values[2]
+        else:
+            return None
+        return [subtype, [str(room.room_id)]]
+
+    def datagram_received(self, packet: bytes, peer: tuple[str, int]) -> None:
+        session = self.sessions.get(peer)
+        if session is None and not any(ip == peer[0] and expiry > time.monotonic()
+                                       for (ip, _), expiry in self.pending_handoffs.items()):
+            return
+        if not HEADER.size <= len(packet) <= 2048:
+            LOG.info("UDP ignored peer=%s size=%d", peer, len(packet))
+            return
+        _, _, size, flags, segment, ack = HEADER.unpack_from(packet)
+        LOG.info("UDP peer=%s size=%d declared=%d flags=0x%04x segment=%d ack=%d",
+                 peer, len(packet), size, flags, segment, ack)
+        if size > len(packet) - HEADER.size:
+            LOG.info("UDP rejected peer=%s: unexpected length", peer)
+            return
+        if flags & SYN:
+            try:
+                reply = syn_reply(packet)
+            except ValueError:
+                LOG.info("UDP SYN peer=%s did not match candidate layout", peer)
+                return
+            if self.transport is not None:
+                self.transport.sendto(reply, peer)
+            _, signature, seed, _ = WINDOW.unpack_from(packet, HEADER.size)
+            self.sessions[peer] = Session(signature, seed, last_seen=time.monotonic())
+            LOG.info("candidate UDP SYN-ACK sent peer=%s", peer)
+            return
+        if session is None:
+            return
+        session.last_seen = time.monotonic()
+        if flags & ACK and ack in session.notifications:
+            session.notifications.pop(ack)
+            LOG.info("UDP host notification acknowledged peer=%s sequence=%d", peer, ack)
+        if flags & FIN:
+            self.send_ack(peer, session, segment)
+            self.remove_session(peer)
+            return
+        if size == 0:
+            if flags & IDENT == IDENT and not flags & ACK:
+                self.send_ack(peer, session, segment)
+                LOG.info("UDP empty segment acknowledged peer=%s segment=%d", peer, segment)
+            return
+        if size >= HEADER_SIZE:
+            try:
+                frame = packet[HEADER.size:HEADER.size + size]
+                header = GSHeader.decode(frame[:HEADER_SIZE])
+                LOG.info("UDP GS peer=%s type=0x%02x property=%d size=%d", peer,
+                         header.message_type, header.property, header.size)
+                if header.property == 0 and header.size == len(frame):
+                    fields = data.decode(gsxor.decrypt(frame[HEADER_SIZE:]))
+                    LOG.info("UDP GS structure peer=%s count=%d field_types=%s", peer,
+                             len(fields), [type(field).__name__ for field in fields])
+                    if session.last_segment == segment and session.last_reply is not None:
+                        if self.transport is not None:
+                            self.transport.sendto(session.last_reply, peer)
+                        return
+                    if (header.message_type == 0xd2 and len(fields) == 2
+                            and all(isinstance(field, str) for field in fields)
+                            and fields[1].isascii() and fields[1].isdecimal()):
+                        owner = fields[0].casefold()
+                        key = (peer[0], owner)
+                        if self.pending_handoffs.get(key, 0) <= time.monotonic():
+                            LOG.info("UDP host login rejected peer=%s: no pending handoff", peer)
+                            return
+                        room = self.registry.activate(int(fields[1]), owner, peer[0])
+                        if room is None:
+                            LOG.info("UDP host login rejected peer=%s: room ownership mismatch", peer)
+                            return
+                        self.pending_handoffs.pop(key, None)
+                        session.room = room
+                        response = gsxor.encrypt(data.encode(["210", ["1", str(room.room_id)]]))
+                        response_header = GSHeader(HEADER_SIZE + len(response), 0, header.priority,
+                                                   0x26, header.receiver, header.sender).encode()
+                        self.send_message(peer, session, segment, response_header + response)
+                        LOG.info("experimental UDP host login accepted peer=%s room=%d", peer, room.room_id)
+                    elif header.message_type == 0xd1 and session.room is not None:
+                        response_fields = self.host_operation(session, fields)
+                        subtype = fields[0] if fields and isinstance(fields[0], str) else "invalid"
+                        if response_fields is None:
+                            LOG.info("unsupported UDP host operation peer=%s subtype=%s", peer, subtype[:16])
+                            return
+                        response = gsxor.encrypt(data.encode(response_fields))
+                        response_header = GSHeader(HEADER_SIZE + len(response), 0, header.priority,
+                                                   0x26, header.receiver, header.sender).encode()
+                        self.send_message(peer, session, segment, response_header + response)
+                        LOG.info("experimental UDP host operation accepted peer=%s room=%d subtype=%s",
+                                 peer, session.room.room_id, subtype)
+            except (ValueError, IndexError):
+                LOG.info("UDP payload peer=%s not decoded", peer)

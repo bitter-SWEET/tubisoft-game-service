@@ -1,0 +1,42 @@
+name: tubisoft
+services:
+  game-service:
+    image: tubisoft-game-service:beta
+    build: .
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 256m
+    tmpfs: [/tmp:rw,noexec,nosuid,size=16m]
+    environment:
+      TUBISOFT_ADVERTISE_IP: ${TUBISOFT_ADVERTISE_IP:?Set the server IPv4 address}
+      TUBISOFT_ALLOWED_CIDRS: ${TUBISOFT_ALLOWED_CIDRS:?Set tester CIDRs}
+      TUBISOFT_BIND_IP: 0.0.0.0
+      TUBISOFT_STATE_DIR: /state
+      TUBISOFT_ROUTER_PORT: ${TUBISOFT_ROUTER_PORT:-30000}
+      TUBISOFT_LAUNCHER_PORT: ${TUBISOFT_LAUNCHER_PORT:-30001}
+      TUBISOFT_NAT_PORT: ${TUBISOFT_NAT_PORT:-30002}
+    ports:
+      - "${TUBISOFT_HTTP_BIND:-127.0.0.1}:${TUBISOFT_HTTP_PUBLISH_PORT:-18080}:8080/tcp"
+      - "${TUBISOFT_ROUTER_PORT:-30000}:${TUBISOFT_ROUTER_PORT:-30000}/tcp"
+      - "${TUBISOFT_ROUTER_PORT:-30000}:${TUBISOFT_ROUTER_PORT:-30000}/udp"
+      - "${TUBISOFT_LAUNCHER_PORT:-30001}:${TUBISOFT_LAUNCHER_PORT:-30001}/tcp"
+      - "${TUBISOFT_NAT_PORT:-30002}:${TUBISOFT_NAT_PORT:-30002}/udp"
+    volumes:
+      - tubisoft-state:/state
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; assert urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=2).read().strip()==b'ok'"]
+      interval: 30s
+      timeout: 3s
+      start_period: 15s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+volumes:
+  tubisoft-state:

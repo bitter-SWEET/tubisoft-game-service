@@ -1,0 +1,10 @@
+**
+!src/
+!src/**
+!pyproject.toml
+!README.md
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+src/**/__pycache__/
+src/**/*.pyc
+src/**/*.egg-info/

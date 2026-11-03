@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tubisoft-game-service"
+version = "0.1.0"
+description = "Tubisoft: experimental Ubisoft Game Services revival for PS2"
+license = "GPL-3.0-only"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+requires-python = ">=3.10"
+dependencies = ["cryptography>=46,<51"]
+
+[project.scripts]
+tubisoft-server = "ubisoft.service:main"
+tubisoft-admin = "ubisoft.admin:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

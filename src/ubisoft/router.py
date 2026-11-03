@@ -1,0 +1,524 @@
+"""Experimental GS router: public-key handshake and bounded metadata logs.
+
+This service provides experimental local account, lobby and room-registration
+handlers. Their wire compatibility beyond observed flows remains unverified.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import secrets
+import time
+from pathlib import Path
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+from . import accounts, crypto, data, gsxor, nat, rooms, srp_probe
+from .bootstrap import port_number
+from .frame import GSHeader, HEADER_SIZE, read_frame
+from .games.xiii import player_port
+from .access import AccessPolicy
+
+LOG = logging.getLogger("ubisoft.router")
+KEY_EXCHANGE = 0xDB
+PARENT_LOBBY = ["0", "XIII", "1", "1", "0", "0", "1", "", "", "", b"", "0", "8", "0"]
+
+
+def response_header(request: GSHeader, payload: bytes, message_type: int | None = None) -> bytes:
+    return GSHeader(HEADER_SIZE + len(payload), 0, request.priority,
+                    request.message_type if message_type is None else message_type,
+                    request.receiver, request.sender).encode()
+
+
+def make_frame(request: GSHeader, fields: list) -> bytes:
+    payload = gsxor.encrypt(data.encode(fields))
+    return response_header(request, payload) + payload
+
+
+def load_key(path: Path) -> rsa.RSAPrivateKey:
+    key = serialization.load_pem_private_key(path.read_bytes(), password=None)
+    if not isinstance(key, rsa.RSAPrivateKey) or key.key_size != 512:
+        raise ValueError("router requires a 512-bit RSA private key")
+    return key
+
+
+async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                 private_key: rsa.RSAPrivateKey, timeout: float, account_db: Path,
+                 wait_host: str, wait_port: int,
+                 pending_handoffs: dict[tuple[str, str], float],
+                 authenticated: dict[tuple[str, str], float],
+                 registry: rooms.RoomRegistry,
+                 host_probe: srp_probe.Probe | None = None,
+                 access_policy: AccessPolicy | None = None) -> None:
+    peer = writer.get_extra_info("peername")
+    local = writer.get_extra_info("sockname")
+    LOG.info("connected peer=%s local=%s", peer, local)
+    game_public: crypto.GSPublicKey | None = None
+    client_key: bytes | None = None
+    server_key: bytes | None = None
+    logged_in_user: str | None = None
+    wait_user: str | None = None
+    host_room: rooms.Room | None = None
+    joined_room: rooms.Room | None = None
+    join_endpoint_sent = False
+    host_member_notified = False
+    closed_room_id: int | None = None
+
+    def room_removed(room: rooms.Room) -> None:
+        nonlocal joined_room, join_endpoint_sent, host_member_notified, closed_room_id
+        if joined_room is not room:
+            return
+        # 0x01d73780 reads the nested room ID and removes the cached group.
+        # Ending a hosted game does not invalidate the guest's GS sign-in.
+        joined_room.members.discard((peer[0], wait_user.casefold()))
+        joined_room.member_info.pop((peer[0], wait_user.casefold()), None)
+        joined_room = None
+        closed_room_id = room.room_id
+        join_endpoint_sent = False
+        host_member_notified = False
+        payload = gsxor.encrypt(data.encode(["55", [str(room.room_id)]]))
+        try:
+            writer.write(GSHeader(HEADER_SIZE + len(payload), 0, 1, 0xd1, 2, 4).encode() + payload)
+            LOG.info("room-closed notification sent peer=%s room=%d; sign-in session retained", peer, room.room_id)
+        except (ConnectionError, OSError):
+            LOG.info("room-closed notification skipped peer=%s: connection already closed", peer)
+
+    registry.add_remove_listener(room_removed)
+    async def account_operation(operation, *arguments):
+        if access_policy is None:
+            return await asyncio.to_thread(operation, *arguments)
+        async with access_policy.hash_slots:
+            return await asyncio.to_thread(operation, *arguments)
+    try:
+        while True:
+            header, payload = await asyncio.wait_for(read_frame(reader, maximum_size=65535), timeout)
+            LOG.info("frame peer=%s type=0x%02x property=%d size=%d sender=%d receiver=%d",
+                     peer, header.message_type, header.property, header.size,
+                     header.sender, header.receiver)
+            if header.message_type == KEY_EXCHANGE and header.property == 0:
+                fields = data.decode(gsxor.decrypt(payload))
+                if (len(fields) != 2 or fields[0] not in ("1", "2")
+                        or not isinstance(fields[1], list) or len(fields[1]) != 3
+                        or not isinstance(fields[1][2], bytes)):
+                    raise ValueError("unrecognized key exchange structure")
+                subtype = fields[0]
+                key_blob = fields[1][2]
+                if subtype == "1":
+                    game_public = crypto.GSPublicKey.decode(key_blob)
+                    public = private_key.public_key().public_numbers()
+                    public_bytes = crypto.GSPublicKey(private_key.key_size, public.n, public.e).encode()
+                    writer.write(make_frame(header, ["1", ["1", str(len(public_bytes)), public_bytes]]))
+                    LOG.info("key exchange peer=%s received=public bits=%d sent=public", peer, game_public.bits)
+                else:
+                    if game_public is None:
+                        raise ValueError("cipher key received before public key")
+                    client_key = private_key.decrypt(key_blob, padding.PKCS1v15())
+                    if len(client_key) != 16:
+                        raise ValueError("unexpected client cipher key length")
+                    server_key = secrets.token_bytes(16)
+                    encrypted = game_public.encrypt(server_key)
+                    writer.write(make_frame(header, ["2", ["1", str(len(encrypted)), encrypted]]))
+                    LOG.info("key exchange peer=%s received=cipher-key sent=cipher-key", peer)
+                await writer.drain()
+                continue
+            if header.property == 2 and client_key is not None and server_key is not None:
+                # XIII sends the first encrypted frame immediately after its key,
+                # so check both possible directions without logging its contents.
+                for direction, key in (("client", client_key), ("server", server_key)):
+                    try:
+                        decoded = crypto.decrypt_payload(key, payload)
+                        fields = data.decode(decoded)
+                    except ValueError:
+                        continue
+                    LOG.info("encrypted message peer=%s type=0x%02x key=%s decoded_fields=%d field_types=%s",
+                             peer, header.message_type, direction, len(fields),
+                             [type(field).__name__ for field in fields])
+                    break
+                else:
+                    LOG.info("encrypted payload rejected peer=%s with both key directions", peer)
+                    break
+                if header.message_type == 1 and len(fields) == 7 and all(isinstance(field, str) for field in fields):
+                    if access_policy is not None and not access_policy.allow_authentication(peer[0]):
+                        LOG.info("account request throttled peer=%s", peer)
+                        break
+                    # Executable call chain: product version, username, password,
+                    # followed by four optional fields.
+                    created = await account_operation(accounts.create_account, account_db, fields[1], fields[2])
+                    if created:
+                        payload = gsxor.encrypt(data.encode([bytes([header.message_type])]))
+                        writer.write(response_header(header, payload, 0x26) + payload)
+                        await writer.drain()
+                        LOG.info("account stored peer=%s; experimental success response sent", peer)
+                    else:
+                        LOG.info("account already exists peer=%s; duplicate response not implemented", peer)
+                elif (header.message_type == 0x66 and len(fields) == 4
+                      and all(isinstance(field, str) for field in fields[:3])
+                      and isinstance(fields[3], bytes)):
+                    if access_policy is not None and not access_policy.allow_authentication(peer[0]):
+                        LOG.info("login request throttled peer=%s", peer)
+                        break
+                    if await account_operation(accounts.verify_account, account_db, fields[0], fields[1]):
+                        payload = gsxor.encrypt(data.encode([bytes([header.message_type])]))
+                        writer.write(response_header(header, payload, 0x26) + payload)
+                        await writer.drain()
+                        LOG.info("local login accepted peer=%s", peer)
+                        logged_in_user = fields[0].casefold()
+                        authenticated[(peer[0], logged_in_user)] = time.monotonic() + 120
+                        continue
+                    LOG.info("local login rejected peer=%s; failure response not implemented", peer)
+                elif (header.message_type == 0x66 and len(fields) == 3
+                      and all(isinstance(field, str) for field in fields)
+                      and local[1] != wait_port):
+                    now = time.monotonic()
+                    candidates = [key for key, expiry in authenticated.items()
+                                  if key[0] == peer[0] and expiry > now]
+                    if len(candidates) == 1:
+                        logged_in_user = candidates[0][1]
+                        # Launcher callback 0x01d65440 requires a nested list
+                        # containing a string in addition to the message ID.
+                        payload = gsxor.encrypt(data.encode([b"\x66", [""]]))
+                        writer.write(response_header(header, payload, 0x26) + payload)
+                        await writer.drain()
+                        LOG.info("experimental launcher login accepted from active local session peer=%s", peer)
+                        continue
+                    LOG.info("launcher login rejected peer=%s: no unique active session", peer)
+            else:
+                if (header.property == 0 and header.message_type == 0x5c
+                        and not payload and wait_user is not None):
+                    # Friends-disconnect is separate from router logout.
+                    # 0x01d6cbd0 sends an empty message without awaiting a result.
+                    LOG.info("friends channel disconnected peer=%s; sign-in session retained", peer)
+                    continue
+                if header.property == 0 and header.message_type == 0x3a and wait_user is not None:
+                    authenticated[(peer[0], wait_user.casefold())] = time.monotonic() + 120
+                    LOG.info("wait module heartbeat peer=%s", peer)
+                    continue
+                if header.property == 0 and header.message_type == 0x5d and logged_in_user:
+                    now = time.monotonic()
+                    for key, expiry in list(pending_handoffs.items()):
+                        if expiry <= now:
+                            del pending_handoffs[key]
+                    pending_handoffs[(peer[0], logged_in_user)] = now + 120
+                    payload = gsxor.encrypt(data.encode([b"\x5d", [wait_host, wait_port.to_bytes(4, "little")]]))
+                    writer.write(response_header(header, payload, 0x26) + payload)
+                    await writer.drain()
+                    LOG.info("wait module address sent peer=%s", peer)
+                    continue
+                if header.property == 0 and payload:
+                    try:
+                        fields = data.decode(gsxor.decrypt(payload))
+                        LOG.info("plain message structure peer=%s count=%d field_types=%s", peer,
+                                 len(fields), [type(field).__name__ for field in fields])
+                        if (header.message_type == 0xd9 and local[1] != wait_port
+                                and logged_in_user is not None and len(fields) == 2
+                                and all(isinstance(field, str) for field in fields)):
+                            # Launcher callback 0x01d65750 expects a list of
+                            # parent group records followed by an implicit end.
+                            groups = [["1", "1", "XIII", "0", "8"]]
+                            payload = gsxor.encrypt(data.encode([b"\xd9", groups]))
+                            writer.write(response_header(header, payload, 0x26) + payload)
+                            await writer.drain()
+                            LOG.info("experimental launcher parent list sent peer=%s", peer)
+                            continue
+                        if (header.message_type == 0xd5 and local[1] != wait_port
+                                and logged_in_user is not None):
+                            if len(fields) == 3 and isinstance(fields[2], list):
+                                LOG.info("registration structure peer=%s field_types=%s binary_lengths=%s",
+                                         peer, [type(field).__name__ for field in fields[2]],
+                                         [len(field) for field in fields[2] if isinstance(field, bytes)])
+                            try:
+                                created_room = registry.register(logged_in_user, peer[0], fields)
+                            except ValueError as exc:
+                                LOG.info("registration rejected peer=%s reason=%s", peer, exc)
+                                break
+                            pending_handoffs[(peer[0], logged_in_user)] = created_room.pending_until
+                            payload = gsxor.encrypt(data.encode([b"\xd5", [wait_host, str(wait_port),
+                                                                              str(created_room.room_id), ""]]))
+                            writer.write(response_header(header, payload, 0x26) + payload)
+                            await writer.drain()
+                            LOG.info("local room registered peer=%s id=%d; awaiting host login", peer, created_room.room_id)
+                            continue
+                        if (header.message_type == 0x4d and len(fields) == 1
+                                and isinstance(fields[0], str)
+                                and client_key is not None and server_key is not None):
+                            key = (peer[0], fields[0].casefold())
+                            expiry = pending_handoffs.pop(key, 0)
+                            if expiry > time.monotonic():
+                                payload = gsxor.encrypt(data.encode([b"\x4d"]))
+                                writer.write(response_header(header, payload, 0x26) + payload)
+                                await writer.drain()
+                                wait_user = fields[0]
+                                LOG.info("wait module login accepted peer=%s", peer)
+                                continue
+                            LOG.info("wait module login rejected peer=%s: no pending handoff", peer)
+                        elif (header.message_type == 0xd2 and len(fields) >= 2
+                              and isinstance(fields[0], str)
+                              and isinstance(fields[1], (str, bytes))):
+                            key = (peer[0], fields[0].casefold())
+                            expiry = pending_handoffs.pop(key, 0)
+                            if expiry > time.monotonic():
+                                if len(fields) == 2:
+                                    if not isinstance(fields[1], str) or not fields[1].isascii() or not fields[1].isdecimal():
+                                        LOG.info("host lobby login rejected peer=%s: invalid room id", peer)
+                                        break
+                                    host_room = registry.activate(int(fields[1]), fields[0].casefold(), peer[0])
+                                    if host_room is None:
+                                        LOG.info("host lobby login rejected peer=%s: room ownership mismatch", peer)
+                                        break
+                                payload = gsxor.encrypt(data.encode(["210", [fields[1]]]))
+                                writer.write(response_header(header, payload, 0x26) + payload)
+                                await writer.drain()
+                                wait_user = fields[0]
+                                LOG.info("lobby server login accepted peer=%s", peer)
+                                continue
+                            LOG.info("lobby server login rejected peer=%s: no pending handoff", peer)
+                        elif (header.message_type == 0x13 and wait_user is not None
+                              and len(fields) == 1 and isinstance(fields[0], str)
+                              and fields[0].casefold() == wait_user.casefold()):
+                            profile = [wait_user, wait_user, "", "", "", "", ""]
+                            payload = gsxor.encrypt(data.encode([b"\x13", profile]))
+                            writer.write(response_header(header, payload, 0x26) + payload)
+                            await writer.drain()
+                            LOG.info("player info sent peer=%s", peer)
+                            continue
+                        elif (header.message_type == 0x4e and wait_user is not None
+                              and len(fields) == 2
+                              and all(isinstance(field, bytes) and len(field) == 4 for field in fields)):
+                            # Friends operations are not implemented; accept the
+                            # login so this optional channel stays connected.
+                            payload = gsxor.encrypt(data.encode([b"\x4e"]))
+                            writer.write(response_header(header, payload, 0x26) + payload)
+                            await writer.drain()
+                            LOG.info("experimental friends login accepted peer=%s", peer)
+                            continue
+                        elif (header.message_type == 0xd1 and wait_user is not None
+                              and len(fields) == 2 and isinstance(fields[0], str)
+                              and isinstance(fields[1], list)
+                              and fields[0].isascii() and fields[0].isdigit()
+                              and len(fields[0]) <= 3):
+                            subtype = int(fields[0])
+                            LOG.info("lobby request peer=%s subtype=%d", peer, subtype)
+                            if subtype == 21:
+                                payload = gsxor.encrypt(data.encode(["38", ["21"]]))
+                                writer.write(response_header(header, payload, 0xd1) + payload)
+                                # Candidate shared GS parent lobby, with no game rooms.
+                                # This record layout comes from a different GS title and
+                                # must be verified with XIII before it is relied upon.
+                                payload = gsxor.encrypt(data.encode(["53", ["1", "256", ["0"], [PARENT_LOBBY]]]))
+                                writer.write(response_header(header, payload, 0xd1) + payload)
+                                await writer.drain()
+                                LOG.info("discovery login response and experimental parent lobby sent peer=%s", peer)
+                                continue
+                            if (subtype == 3 and len(fields[1]) >= 1
+                                    and isinstance(fields[1][0], str) and fields[1][0] == "1"):
+                                pending_handoffs[(peer[0], wait_user.casefold())] = time.monotonic() + 120
+                                payload = gsxor.encrypt(data.encode(["38", ["3", ["1", wait_host, str(wait_port)]]]))
+                                writer.write(response_header(header, payload, 0xd1) + payload)
+                                await writer.drain()
+                                LOG.info("lobby server address sent peer=%s", peer)
+                                continue
+                            if (subtype == 9 and len(fields[1]) >= 1
+                                    and isinstance(fields[1][0], str) and fields[1][0] == "1"):
+                                # Group-info notification with the actual local parent
+                                # and no child game rooms; the prior subtype-9 reply
+                                # caused XIII to report that the group did not exist.
+                                payload = gsxor.encrypt(data.encode(["53", ["1", "256", PARENT_LOBBY, registry.children()]]))
+                                writer.write(response_header(header, payload, 0xd1) + payload)
+                                await writer.drain()
+                                LOG.info("lobby group sent peer=%s active_rooms=%d", peer, len(registry.children()))
+                                continue
+                            if (subtype == 24 and len(fields[1]) == 5
+                                    and all(isinstance(item, str) for item in fields[1])):
+                                values = fields[1]
+                                if (not values[0].isascii() or not values[0].isdecimal()
+                                        or len(values[0]) > 10 or values[1]
+                                        or not all(value.isascii() and value.isdecimal() for value in values[2:4])):
+                                    LOG.info("unsupported room join request peer=%s", peer)
+                                    break
+                                room = registry.active_room(int(values[0]))
+                                if room is None:
+                                    LOG.info("room join rejected peer=%s: room unavailable", peer)
+                                    break
+                                member = (peer[0], wait_user.casefold())
+                                if joined_room is not None:
+                                    joined_room.members.discard(member)
+                                    joined_room.member_info.pop(member, None)
+                                room.members.add(member)
+                                joined_room = room
+                                join_endpoint_sent = False
+                                host_member_notified = False
+                                # XIII parser 0x01d72af0 expects the room ID in
+                                # the inner list of this lobby-success envelope.
+                                payload = gsxor.encrypt(data.encode(["38", ["24", [str(room.room_id)]]]))
+                                writer.write(response_header(header, payload, 0xd1) + payload)
+                                # Populate the room record; this is separate
+                                # from the GAME_STARTED join-completion event.
+                                payload = gsxor.encrypt(data.encode(["53", [str(room.room_id), "64", room.group_fields()]]))
+                                writer.write(response_header(header, payload, 0xd1) + payload)
+                                await writer.drain()
+                                LOG.info("experimental room join accepted peer=%s room=%d", peer, room.room_id)
+                                continue
+                            if (subtype == 46 and len(fields[1]) == 1
+                                    and isinstance(fields[1][0], str)
+                                    and fields[1][0].isascii() and fields[1][0].isdecimal()):
+                                room = registry.active_room(int(fields[1][0]))
+                                if room is None:
+                                    LOG.info("additional room info unavailable peer=%s", peer)
+                                    continue
+                                payload = gsxor.encrypt(data.encode(["38", ["46", [str(room.room_id), room.additional_info]]]))
+                                writer.write(response_header(header, payload, 0xd1) + payload)
+                                await writer.drain()
+                                LOG.info("additional room info sent peer=%s room=%d", peer, room.room_id)
+                                continue
+                            if (subtype == 42 and joined_room is not None and len(fields[1]) == 1
+                                    and isinstance(fields[1][0], bytes) and len(fields[1][0]) <= 16384):
+                                if registry.active_room(joined_room.room_id) is not joined_room:
+                                    LOG.info("player info rejected peer=%s: host room unavailable", peer)
+                                    break
+                                joined_room.member_info[(peer[0], wait_user.casefold())] = fields[1][0]
+                                is_owner = (peer[0], wait_user.casefold()) == (joined_room.peer_ip, joined_room.owner)
+                                if host_probe is not None and joined_room.product == "XIIIPS2US" and not is_owner:
+                                    guest_port = player_port(fields[1][0])
+                                    notified = host_probe.member_info(joined_room, wait_user, peer[0],
+                                                                      fields[1][0], new=not host_member_notified)
+                                    host_member_notified |= notified
+                                    LOG.info("member endpoint peer=%s game_port=%d host_notified=%s",
+                                             peer, guest_port, notified)
+                                payload = gsxor.encrypt(data.encode(["38", ["42"]]))
+                                writer.write(response_header(header, payload, 0xd1) + payload)
+                                # The room-join success only starts player-info
+                                # setup. GAME_STARTED (56) reaches 0x01d8cdf0
+                                # and the game's 0x00382670 completion callback.
+                                if not join_endpoint_sent:
+                                    payload = gsxor.encrypt(data.encode(joined_room.game_started_fields()))
+                                    writer.write(response_header(header, payload, 0xd1) + payload)
+                                    join_endpoint_sent = True
+                                    LOG.info("host endpoint sent peer=%s room=%d host=%s port=%s",
+                                             peer, joined_room.room_id, joined_room.peer_ip, joined_room.game_port)
+                                await writer.drain()
+                                LOG.info("player info updated peer=%s room=%d", peer, joined_room.room_id)
+                                continue
+                            if (subtype == 8 and len(fields[1]) == 1
+                                    and isinstance(fields[1][0], str)):
+                                group_id = fields[1][0]
+                                # Cleanup can name the parent or reset sentinel,
+                                # or repeat a leave after GROUP_REMOVE arrived.
+                                allowed = {"0", "1"}
+                                if joined_room is not None:
+                                    allowed.add(str(joined_room.room_id))
+                                if closed_room_id is not None:
+                                    allowed.add(str(closed_room_id))
+                                if group_id not in allowed:
+                                    LOG.info("room leave ignored peer=%s: group not associated with this session", peer)
+                                    continue
+                                if joined_room is not None:
+                                    joined_room.members.discard((peer[0], wait_user.casefold()))
+                                    joined_room.member_info.pop((peer[0], wait_user.casefold()), None)
+                                    if host_probe is not None and host_member_notified:
+                                        host_probe.notify_host(joined_room, [["51", [wait_user]]])
+                                host_member_notified = False
+                                payload = gsxor.encrypt(data.encode(["38", ["8", [group_id]]]))
+                                writer.write(response_header(header, payload, 0xd1) + payload)
+                                await writer.drain()
+                                LOG.info("room leave accepted peer=%s group=%s; sign-in session retained", peer, group_id)
+                                joined_room = None
+                                continue
+                            LOG.info("unsupported lobby request peer=%s subtype=%d nested_types=%s", peer, subtype,
+                                     [type(item).__name__ for item in fields[1]])
+                    except ValueError:
+                        LOG.info("plain message peer=%s could not be decoded", peer)
+                LOG.info("unhandled message peer=%s type=0x%02x", peer, header.message_type)
+            # Avoid fabricating account creation or login results.
+            break
+    except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError,
+            ValueError, TypeError) as exc:
+        LOG.info("closed peer=%s reason=%s", peer, type(exc).__name__)
+    finally:
+        registry.remove_remove_listener(room_removed)
+        if joined_room is not None and wait_user is not None:
+            joined_room.members.discard((peer[0], wait_user.casefold()))
+            joined_room.member_info.pop((peer[0], wait_user.casefold()), None)
+            if host_probe is not None and host_member_notified:
+                host_probe.notify_host(joined_room, [["51", [wait_user]]])
+        if host_room is not None:
+            registry.remove(host_room.room_id, host_room.owner, host_room.peer_ip)
+            LOG.info("host connection closed; room removed id=%d", host_room.room_id)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except ConnectionError:
+            pass
+
+
+async def serve(args: argparse.Namespace) -> None:
+    key = load_key(args.private_key)
+    pending_handoffs: dict[tuple[str, str], float] = {}
+    authenticated: dict[tuple[str, str], float] = {}
+    registry = rooms.RoomRegistry()
+    host_probe = srp_probe.Probe(pending_handoffs, registry)
+    advertise_ip = getattr(args, "advertise_ip", None) or args.bind
+    access_policy = getattr(args, "access_policy", None)
+    async def callback(reader, writer):
+        peer_ip = writer.get_extra_info("peername")[0]
+        if access_policy is not None and not access_policy.acquire(peer_ip):
+            writer.close()
+            await writer.wait_closed()
+            return
+        try:
+            await handle(reader, writer, key, args.timeout, args.account_db, advertise_ip, args.port,
+                         pending_handoffs, authenticated, registry, host_probe, access_policy)
+        finally:
+            if access_policy is not None:
+                access_policy.release(peer_ip)
+    server = await asyncio.start_server(callback, args.bind, args.port)
+    launcher = None
+    udp_transport = None
+    nat_transport = None
+    try:
+        udp_transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+            lambda: host_probe, local_addr=(args.bind, args.port))
+        if args.nat_port:
+            nat_transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+                lambda: nat.Discovery(args.nat_allowed_cidr), local_addr=(args.bind, args.nat_port))
+        if args.launcher_port:
+            launcher = await asyncio.start_server(callback, args.bind, args.launcher_port)
+            LOG.info("experimental launcher listening at %s", launcher.sockets[0].getsockname())
+        LOG.info("router handshake listening at %s", server.sockets[0].getsockname())
+        await server.serve_forever()
+    finally:
+        server.close()
+        await server.wait_closed()
+        if udp_transport is not None:
+            udp_transport.close()
+        if nat_transport is not None:
+            nat_transport.close()
+        if launcher is not None:
+            launcher.close()
+            await launcher.wait_closed()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bind", default="127.0.0.1")
+    parser.add_argument("--advertise-ip", help="address clients can reach; defaults to the bind address")
+    parser.add_argument("--port", type=port_number, default=30000)
+    parser.add_argument("--launcher-port", type=port_number)
+    parser.add_argument("--nat-port", type=port_number)
+    parser.add_argument("--nat-allowed-cidr", default="127.0.0.0/8")
+    parser.add_argument("--private-key", type=Path, required=True)
+    parser.add_argument("--account-db", type=Path, required=True)
+    parser.add_argument("--timeout", type=float, default=30)
+    args = parser.parse_args()
+    if not 0 < args.timeout <= 300:
+        parser.error("timeout must be between 0 and 300 seconds")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        asyncio.run(serve(args))
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
