@@ -172,19 +172,23 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                 elif (header.message_type == 0x66 and len(fields) == 3
                       and all(isinstance(field, str) for field in fields)
                       and local[1] != wait_port):
-                    now = time.monotonic()
-                    candidates = [key for key, expiry in authenticated.items()
-                                  if key[0] == peer[0] and expiry > now]
-                    if len(candidates) == 1:
-                        logged_in_user = candidates[0][1]
+                    if access_policy is not None and not access_policy.allow_authentication(peer[0]):
+                        LOG.info("launcher login throttled peer=%s", peer)
+                        break
+                    # 0x00380b34 -> 0x00383f20 -> 0x01d64990 sends the
+                    # same username/password as sign-in, then the version.
+                    # Verify this connection's identity rather than guessing
+                    # from the other accounts sharing its public IP.
+                    if await account_operation(accounts.verify_account, account_db, fields[0], fields[1]):
+                        logged_in_user = fields[0].casefold()
                         # Launcher callback 0x01d65440 requires a nested list
                         # containing a string in addition to the message ID.
                         payload = gsxor.encrypt(data.encode([b"\x66", [""]]))
                         writer.write(response_header(header, payload, 0x26) + payload)
                         await writer.drain()
-                        LOG.info("experimental launcher login accepted from active local session peer=%s", peer)
+                        LOG.info("launcher credentials accepted peer=%s", peer)
                         continue
-                    LOG.info("launcher login rejected peer=%s: no unique active session", peer)
+                    LOG.info("launcher credentials rejected peer=%s", peer)
             else:
                 if (header.property == 0 and header.message_type == 0x5c
                         and not payload and wait_user is not None):

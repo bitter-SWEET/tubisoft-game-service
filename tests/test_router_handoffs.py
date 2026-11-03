@@ -2,6 +2,7 @@ import asyncio
 import time
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -38,6 +39,68 @@ class Writer:
 
 
 class HandoffTests(unittest.IsolatedAsyncioTestCase):
+    async def launcher_session(self, database, username, password, authenticated, registry, pending):
+        peer = "192.0.2.2"
+        reader = asyncio.StreamReader()
+        for fields in (["1", ["1", "0", b"key"]], ["2", ["1", "0", b"key"]]):
+            reader.feed_data(frame(0xdb, fields))
+        reader.feed_data(frame(0x66, [], property=2))
+        reader.feed_data(frame(0xd5, ["12", "1", [
+            "launcher", "1", "Same room name", "XIIIPS2US", "6", "16", "0", b"info", b"\0", "",
+            "1.0", "XIIIPS21.0", "8208", peer, "7777", b""]]))
+        reader.feed_eof()
+        writer = Writer(peer, 30001)
+        public = SimpleNamespace(bits=512, encrypt=lambda key: b"encrypted", encode=lambda: b"public")
+        key = SimpleNamespace(key_size=512, decrypt=lambda blob, padding: b"x" * 16,
+                              public_key=lambda: SimpleNamespace(public_numbers=lambda: SimpleNamespace(n=1, e=3)))
+        with patch.object(router.crypto, "GSPublicKey") as public_class, \
+             patch.object(router.crypto, "decrypt_payload", return_value=data.encode([username, password, "1.0"])):
+            public_class.decode.return_value = public
+            public_class.return_value = public
+            await router.handle(reader, writer, key, 1, database, "192.0.2.1", 30000,
+                                pending, authenticated, registry)
+        return writer
+
+    async def test_launchers_sharing_ip_register_rooms_for_their_own_verified_accounts(self):
+        peer = "192.0.2.2"
+        authenticated = {(peer, name): time.monotonic() + 60 for name in ("alpha", "beta", "old-session")}
+        pending = {}
+        registry = RoomRegistry()
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "accounts.sqlite3"
+            for username in ("alpha", "beta"):
+                self.assertTrue(router.accounts.create_account(database, username, username + "-fixture"))
+                await self.launcher_session(database, username.upper(), username + "-fixture",
+                                            authenticated, registry, pending)
+        for room_id, username in ((1000, "alpha"), (1001, "beta")):
+            self.assertIn((peer, username), pending)
+            room = registry.activate(room_id, username, peer)
+            self.assertIsNotNone(room)
+            self.assertEqual(room.owner, username)
+            self.assertEqual(room.name, "Same room name")
+
+    async def test_launcher_does_not_borrow_another_active_accounts_identity(self):
+        peer = "192.0.2.2"
+        authenticated = {(peer, "alpha"): time.monotonic() + 60}
+        pending = {}
+        registry = RoomRegistry()
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "accounts.sqlite3"
+            self.assertTrue(router.accounts.create_account(database, "alpha", "alpha-fixture"))
+            self.assertTrue(router.accounts.create_account(database, "beta", "beta-fixture"))
+            writer = await self.launcher_session(database, "beta", "wrong-fixture",
+                                                 authenticated, registry, pending)
+        self.assertEqual(pending, {})
+        self.assertIsNone(registry.activate(1000, "alpha", peer))
+        self.assertIsNone(registry.activate(1000, "beta", peer))
+        headers = []
+        offset = 0
+        while offset < len(writer.output):
+            header = GSHeader.decode(writer.output[offset:offset + HEADER_SIZE])
+            headers.append(header.message_type)
+            offset += header.size
+        self.assertEqual(headers, [0xdb, 0xdb])
+
     async def test_owner_room_disconnect_clears_udp_registration_and_notifies_guest_without_logout(self):
         registry = RoomRegistry()
         host_ip, guest_ip = "192.0.2.2", "192.0.2.3"
@@ -218,11 +281,13 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         key = SimpleNamespace(key_size=512, decrypt=lambda blob, padding: b"x" * 16,
                               public_key=lambda: SimpleNamespace(public_numbers=lambda: SimpleNamespace(n=1, e=3)))
         with patch.object(router.crypto, "GSPublicKey") as public_class, \
-             patch.object(router.crypto, "decrypt_payload", return_value=data.encode(["a", "b", "c"])):
+             patch.object(router.crypto, "decrypt_payload", return_value=data.encode(["host", "fixture-password", "1.0"])), \
+             patch.object(router.accounts, "verify_account", return_value=True) as verify:
             public_class.decode.return_value = public
             public_class.return_value = public
             await router.handle(reader, writer, key, 1, Path("/unused"), "192.0.2.1", 30000,
                                 pending, authenticated, registry)
+        verify.assert_called_once_with(Path("/unused"), "host", "fixture-password")
         self.assertIn((peer, "host"), pending)
         self.assertIsNotNone(registry.activate(1000, "host", peer))
 
