@@ -17,4 +17,27 @@ jobs:
       - run: python tools/publication_audit.py --git
       - run: python -W error::ResourceWarning -m unittest discover -s tests -v
       - run: docker compose --env-file .env.example config --quiet
-      - run: docker build -t tubisoft-game-service:ci .
+      - run: docker compose --env-file .env.example build
+      - name: Start the actual Compose service
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose=(docker compose --project-name tubisoft-ci --env-file .env.example)
+          trap 'docker rm -f tubisoft-ci-smoke >/dev/null 2>&1 || true; "${compose[@]}" down --volumes' EXIT
+          "${compose[@]}" run --no-deps -d --name tubisoft-ci-smoke game-service
+          docker exec -i tubisoft-ci-smoke python - <<'PY'
+          import time
+          import urllib.request
+          for attempt in range(30):
+              try:
+                  with urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2) as response:
+                      assert response.read() == b'ok\n'
+                  break
+              except OSError:
+                  if attempt == 29:
+                      raise
+                  time.sleep(1)
+          with urllib.request.urlopen('http://127.0.0.1:8080/gsinit.php?dp=XIIIPS2US', timeout=2) as response:
+              assert b'192.0.2.10' in response.read()
+          print('Compose startup and bootstrap passed.')
+          PY

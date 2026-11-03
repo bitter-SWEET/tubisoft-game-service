@@ -10,7 +10,7 @@ services:
     security_opt: [no-new-privileges:true]
     pids_limit: 128
     mem_limit: 256m
-    tmpfs: [/tmp:rw,noexec,nosuid,size=16m]
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
     environment:
       TUBISOFT_ADVERTISE_IP: ${TUBISOFT_ADVERTISE_IP:?Set the server IPv4 address}
       TUBISOFT_ALLOWED_CIDRS: ${TUBISOFT_ALLOWED_CIDRS:-0.0.0.0/0}
