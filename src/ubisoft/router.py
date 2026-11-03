@@ -192,9 +192,16 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                     # 0x01d6cbd0 sends an empty message without awaiting a result.
                     LOG.info("friends channel disconnected peer=%s; sign-in session retained", peer)
                     continue
-                if header.property == 0 and header.message_type == 0x3a and wait_user is not None:
+                if (header.property == 0 and header.message_type == 0x3a
+                        and not payload and wait_user is not None):
                     authenticated[(peer[0], wait_user.casefold())] = time.monotonic() + 120
-                    LOG.info("wait module heartbeat peer=%s", peer)
+                    # The retail TCP reader (0x01d4a7e0) times out after 180
+                    # seconds without received bytes. Its outgoing STILLALIVE
+                    # only updates the separate send clock. Return the empty
+                    # frame on this connection, including the module route.
+                    writer.write(response_header(header, b""))
+                    await writer.drain()
+                    LOG.info("wait module heartbeat peer=%s; empty STILLALIVE returned", peer)
                     continue
                 if header.property == 0 and header.message_type == 0x5d and logged_in_user:
                     now = time.monotonic()

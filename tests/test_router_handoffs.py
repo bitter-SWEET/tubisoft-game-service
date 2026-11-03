@@ -242,8 +242,40 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         first = GSHeader.decode(writer.output[:HEADER_SIZE])
         second = GSHeader.decode(writer.output[first.size:first.size + HEADER_SIZE])
         self.assertEqual(second.message_type, 0x26)
-        self.assertEqual(data.decode(gsxor.decrypt(bytes(writer.output[first.size + HEADER_SIZE:]))), [b"\x4e"])
+        self.assertEqual(data.decode(gsxor.decrypt(bytes(writer.output[first.size + HEADER_SIZE:first.size + second.size]))), [b"\x4e"])
+        heartbeat = GSHeader.decode(writer.output[first.size + second.size:])
+        self.assertEqual(heartbeat, GSHeader(HEADER_SIZE, 0, 1, 0x3a, 2, 1))
         self.assertIn((peer, "guest"), authenticated)
+
+    async def test_heartbeats_return_on_each_authenticated_module_connection(self):
+        # The wait and room connections have independent receive deadlines.
+        # Answering only one must not stand in for answering the other.
+        for module in (1, 2):
+            with self.subTest(module=module):
+                peer = "192.0.2.3"
+                reader = asyncio.StreamReader()
+                reader.feed_data(frame(0xd2, ["guest", "1", "", "", ""]))
+                heartbeat = GSHeader(HEADER_SIZE, 0, 1, 0x3a, 4, module)
+                reader.feed_data(heartbeat.encode() * 8)
+                reader.feed_eof()
+                writer = Writer(peer, 30000)
+                await router.handle(reader, writer, None, 1, Path("/unused"), "192.0.2.1", 30000,
+                                    {(peer, "guest"): time.monotonic() + 60}, {}, RoomRegistry())
+                login = GSHeader.decode(writer.output[:HEADER_SIZE])
+                expected = GSHeader(HEADER_SIZE, 0, 1, 0x3a, module, 4).encode()
+                self.assertEqual(bytes(writer.output[login.size:]), expected * 8)
+
+    async def test_unauthenticated_heartbeat_cannot_create_a_session(self):
+        peer = "192.0.2.3"
+        reader = asyncio.StreamReader()
+        reader.feed_data(GSHeader(HEADER_SIZE, 0, 1, 0x3a, 4, 1).encode())
+        reader.feed_eof()
+        writer = Writer(peer, 30000)
+        authenticated = {}
+        await router.handle(reader, writer, None, 1, Path("/unused"), "192.0.2.1", 30000,
+                            {}, authenticated, RoomRegistry())
+        self.assertEqual(writer.output, b"")
+        self.assertEqual(authenticated, {})
 
     async def test_guest_refresh_sees_active_room_from_another_ip(self):
         registry = RoomRegistry()
