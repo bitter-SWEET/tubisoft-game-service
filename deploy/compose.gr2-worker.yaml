@@ -1,0 +1,8 @@
+# Optional trusted worker discovery. Use with compose.gr2.yaml.
+# The mounted directory must be populated by a running, validated worker or an authenticated worker bridge.
+services:
+  game-service:
+    environment:
+      TUBISOFT_GR2_WORKER_STATE: /run/gr2-worker/current.json
+    volumes:
+      - "${TUBISOFT_GR2_WORKER_DIR:?Set the live worker health directory}:/run/gr2-worker:ro,z"

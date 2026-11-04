@@ -35,6 +35,9 @@ class Room:
     members: set[tuple[str, str]] = field(default_factory=set)
     member_info: dict[tuple[str, str], bytes] = field(default_factory=dict)
     host_connections: set[object] = field(default_factory=set, repr=False)
+    dedicated: bool = False
+    worker_players: int = 0
+    worker_run_id: str | None = None
 
     def game_started_fields(self) -> list:
         return self.profile.game_started_fields(self)
@@ -43,7 +46,7 @@ class Room:
         """Common GS group layout with title-specific advertisement flags."""
         advertised_flags = self.profile.group_flags(self.flags)
         host = (self.peer_ip, self.owner)
-        player_count = 1 + len(self.members - {host})
+        player_count = self.worker_players if self.dedicated else 1 + len(self.members - {host})
         return [self.group_type, self.name, str(self.room_id), "1", self.parent_id,
                 advertised_flags, "2", self.owner, "", self.product, self.info, "0",
                 self.max_players, str(player_count), self.max_spectators, "0",
@@ -55,6 +58,40 @@ class RoomRegistry:
         self._rooms: dict[int, Room] = {}
         self._next_id = 1000
         self._remove_listeners: set[Callable[[Room], None]] = set()
+        self.worker_provider = None
+        self._worker_id = None
+        self._syncing_worker = False
+
+    def sync_worker(self) -> None:
+        """Reflect a local, healthy dedicated worker without a synthetic owner player."""
+        if self.worker_provider is None or self._syncing_worker:
+            return
+        self._syncing_worker = True
+        try:
+            worker = self.worker_provider()
+            current = self._rooms.get(self._worker_id)
+            if current and (worker is None or worker['run_id'] != current.worker_run_id):
+                self._worker_id = None
+                self.remove(current.room_id, current.owner, current.peer_ip)
+                current = None
+            if worker is None:
+                return
+            if current is None:
+                current = Room(self._next_id, 'tubisoft-worker', worker['address'],
+                               **asdict(worker['spec']), profile=worker['profile'],
+                               dedicated=True, worker_run_id=worker['run_id'], active=True)
+                self._next_id += 1
+                self._worker_id = current.room_id
+                self._rooms[current.room_id] = current
+            current.info = worker['spec'].info
+            current.additional_info = worker['spec'].additional_info
+            current.peer_ip = worker['address']
+            current.local_ip = worker['spec'].local_ip
+            current.game_port = worker['spec'].game_port
+            current.max_players = worker['spec'].max_players
+            current.worker_players = worker['players']
+        finally:
+            self._syncing_worker = False
 
     def add_remove_listener(self, listener: Callable[[Room], None]) -> None:
         self._remove_listeners.add(listener)
@@ -80,7 +117,7 @@ class RoomRegistry:
     def activate(self, room_id: int, owner: str, peer_ip: str, product: str = XIII.product) -> Room | None:
         self.expire_pending()
         room = self._rooms.get(room_id)
-        if room is None or room.owner != owner or room.peer_ip != peer_ip or room.product != product:
+        if room is None or room.dedicated or room.owner != owner or room.peer_ip != peer_ip or room.product != product:
             return None
         room.active = True
         return room
@@ -95,7 +132,7 @@ class RoomRegistry:
 
     def bind_host(self, room: Room, owner: str, peer_ip: str, connection: object) -> bool:
         """Bind only the authenticated owner's actual room connection."""
-        if self.active_room(room.room_id) is not room or (owner, peer_ip) != (room.owner, room.peer_ip):
+        if room.dedicated or self.active_room(room.room_id) is not room or (owner, peer_ip) != (room.owner, room.peer_ip):
             return False
         room.host_connections.add(connection)
         return True
@@ -119,8 +156,10 @@ class RoomRegistry:
                 listener(room)
 
     def active_room(self, room_id: int, product: str | None = None) -> Room | None:
+        self.sync_worker()
         room = self._rooms.get(room_id)
         return room if room is not None and room.active and (product is None or room.product == product) else None
 
     def children(self, product: str = XIII.product) -> list:
+        self.sync_worker()
         return [room.group_fields() for room in self._rooms.values() if room.active and room.product == product]

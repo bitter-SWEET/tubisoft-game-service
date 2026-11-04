@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import hashlib
 import hmac
 import ipaddress
@@ -72,7 +73,8 @@ def configuration(environment=None):
         advertise_ip=address, port=port("ROUTER_PORT", 30000), launcher_port=port("LAUNCHER_PORT", 30001),
         nat_port=port("NAT_PORT", 30002), http_port=port("HTTP_PORT", 8080),
         nat_allowed_cidr=allowed, access_policy=AccessPolicy(allowed), timeout=300,
-        state=Path(env.get("TUBISOFT_STATE_DIR", "/state")))
+        state=Path(env.get("TUBISOFT_STATE_DIR", "/state")),
+        gr2_worker_state=Path(env['TUBISOFT_GR2_WORKER_STATE']) if env.get('TUBISOFT_GR2_WORKER_STATE') else None)
 
 
 async def serve(args) -> None:
@@ -87,15 +89,19 @@ async def serve(args) -> None:
     tasks = []
     for binding in args.games:
         profile = binding.profile
+        worker_state = getattr(args, 'gr2_worker_state', None) if profile.slug == 'gr2' else None
+        if worker_state is not None:
+            profile = replace(profile, supports_rooms=True)
         game_args = SimpleNamespace(**(vars(args) | {
             "game_profile": profile, "port": binding.router_port,
-            "launcher_port": binding.launcher_port, "nat_port": binding.nat_port}))
+            "launcher_port": binding.launcher_port, "nat_port": binding.nat_port,
+            "worker_state": worker_state}))
         products[profile.product] = profile.bootstrap(
             args.advertise_ip, binding.router_port, binding.launcher_port,
             args.advertise_ip, binding.nat_port)
         logging.getLogger("ubisoft.service").info(
-            "enabling game=%s product=%s rooms=%s ports=%s", profile.slug,
-            profile.product, profile.supports_rooms,
+            "enabling game=%s product=%s discovery=%s rooms=%s ports=%s", profile.slug,
+            profile.product, profile.supports_discovery or profile.supports_rooms, profile.supports_rooms,
             (binding.router_port, binding.launcher_port, binding.nat_port))
         tasks.append(asyncio.create_task(router.serve(game_args)))
     http = SimpleNamespace(bind=args.bind, port=args.http_port, products=products)

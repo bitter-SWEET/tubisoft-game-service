@@ -6,7 +6,9 @@ Two unmodified **XIII USA** clients (`SLUS-20677`, CRC `FCD97245`) have created 
 
 The common `ubisoft` package provides GS framing, crypto, shared SQLite accounts, lobby state, and NAT discovery. Title adapters live in `ubisoft.games`, with isolated per-game listeners and transient sessions. Existing accounts work across enabled games without copying credentials. See the [multi-game architecture and extension guide](docs/multi-game-architecture.md).
 
-XIII remains enabled by default. Ghost Recon 2 has an opt-in development profile for its native bootstrap format and shared authentication experiments; its room creation/join adapter is not implemented. [GR2 research](docs/ghost-recon-2-network.md) records the evidence and remaining work.
+XIII remains enabled by default. Ghost Recon 2 is an opt-in experimental profile with shared accounts, native bootstrap, login, lobby discovery and empty ranking-table startup. A separate owned-disc gameplay worker can advertise a dedicated Assault room. An unmodified retail client has discovered that room, joined and reached player setup/Ready; movement, combat and round transitions still need multi-player testing. Persistent GR2 rankings are not implemented.
+
+The gameplay engine, PCSX2 launcher, asset adapters and runtime research now live in the separate **gr2-dedicated-server** project folder, prepared for its own repository. Tubisoft contains only shared services and the validated worker-directory interface. See [GR2 workers](docs/gr2-workers.md) and [GR2 protocol research](docs/ghost-recon-2-network.md).
 
 ## Run a beta instance
 
@@ -44,7 +46,7 @@ Copy backups to private storage outside the host. Never use `docker compose down
 
 - The original game requires obsolete RSA/Blowfish formats. Use a unique game-only password. Resource and authentication-attempt limits remain enabled; optional `TUBISOFT_ALLOWED_CIDRS` restrictions are available for private installations.
 - Some handoffs still correlate by source IP and account name. Launcher login verifies its own account credentials and permits separate accounts sharing a public IP; simultaneous shared-NAT retail coverage and a complete session-token model remain follow-up work.
-- Peer gameplay is direct UDP, **not relayed by Tubisoft**. LAN gameplay is verified; separate-network/NAT combinations require testing. NAT discovery alone does not make every host reachable.
+- XIII peer gameplay is direct UDP. GR2 uses a separate dedicated gameplay worker; an optional operator-managed relay can expose that worker. GR2 remote gameplay remains experimental. NAT discovery alone does not make every XIII host reachable.
 - Invalid-login and duplicate-account failure replies, password-protected rooms, persistent rankings, and full SDK operation coverage remain incomplete. Failed operations can time out.
 - Normal round-end readiness is handled by the game. Its disconnect UI can return to sign-in even when the GS connection remains alive. Long-duration sequence rollover and repeated-round testing remain beta work.
 
@@ -66,5 +68,7 @@ The [protocol implementation map](docs/xiii-network-protocol.md), [workflow anal
 python tools/extract_disc.py '/path/to/discs/XIII (USA).iso'
 python tools/extract_gr2.py '/path/to/discs/Ghost Recon 2 (USA).iso'
 ```
+
+For missing platform-auth responses, the [DNAS preservation workbench](docs/dnas-preservation.md) recovers protected GR2 library code and provides private input extraction, replay inventory, transport and comparison tools. It does not yet derive an accepted GR2 response or change the running DNAS service.
 
 Original project code is licensed under **GPLv3**. Referenced MIT code retains its [third-party notice](THIRD_PARTY_NOTICES.md). No game assets, DNAS replays, credentials, or personal deployment configuration are distributed.

@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from ubisoft import data, gsxor, router, srp_probe
 from ubisoft.frame import GSHeader, HEADER_SIZE
+from ubisoft.games.registry import GR2, XIII
 from ubisoft.rooms import RoomRegistry
 
 
@@ -311,6 +312,86 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         heartbeat = GSHeader.decode(writer.output[first.size + second.size:])
         self.assertEqual(heartbeat, GSHeader(HEADER_SIZE, 0, 1, 0x3a, 2, 1))
         self.assertIn((peer, "guest"), authenticated)
+
+    async def test_ignore_list_requires_active_friends_login_and_an_empty_request(self):
+        for scenario in ("anonymous", "wait-only", "disconnected", "nonempty"):
+            with self.subTest(scenario=scenario):
+                peer = "192.0.2.3"
+                reader = asyncio.StreamReader()
+                if scenario != "anonymous":
+                    reader.feed_data(frame(0xd2, ["guest", "1", "", "", ""]))
+                if scenario in ("disconnected", "nonempty"):
+                    reader.feed_data(frame(0x4e, [bytes(4), bytes(4)]))
+                if scenario == "disconnected":
+                    reader.feed_data(GSHeader(HEADER_SIZE, 0, 1, 0x5c, 1, 2).encode())
+                request = (frame(0x54, ["unexpected"]) if scenario == "nonempty"
+                           else GSHeader(HEADER_SIZE, 0, 1, 0x54, 1, 2).encode())
+                reader.feed_data(request)
+                reader.feed_eof()
+                writer = Writer(peer, 30000)
+                await router.handle(reader, writer, None, 1, Path("/unused"), "192.0.2.1", 30000,
+                                    {(peer, "guest"): time.monotonic() + 60}, {}, RoomRegistry())
+                replies = []
+                offset = 0
+                while offset < len(writer.output):
+                    header = GSHeader.decode(writer.output[offset:offset + HEADER_SIZE])
+                    replies.append(data.decode(gsxor.decrypt(bytes(
+                        writer.output[offset + HEADER_SIZE:offset + header.size]))))
+                    offset += header.size
+                self.assertNotIn([b"\x54"], replies)
+                self.assertEqual(len(replies), {"anonymous": 0, "wait-only": 1,
+                                               "disconnected": 2, "nonempty": 2}[scenario])
+
+    async def test_login_notices_require_authentication_and_a_supported_title_and_language(self):
+        for profile, authenticated, fields in ((GR2, False, ["en"]),
+                                                (XIII, True, ["en"]),
+                                                (GR2, True, ["unexpected"])):
+            with self.subTest(profile=profile.slug, authenticated=authenticated, fields=fields):
+                peer = "192.0.2.3"
+                reader = asyncio.StreamReader()
+                if authenticated:
+                    reader.feed_data(frame(0xd2, ["guest", "1", "", "", ""]))
+                reader.feed_data(frame(0xde, fields))
+                reader.feed_eof()
+                writer = Writer(peer, 30000)
+                await router.handle(reader, writer, None, 1, Path("/unused"), "192.0.2.1", 30000,
+                                    {(peer, "guest"): time.monotonic() + 60}, {}, RoomRegistry(),
+                                    game_profile=profile)
+                if authenticated:
+                    login = GSHeader.decode(writer.output[:HEADER_SIZE])
+                    self.assertEqual(len(writer.output), login.size)
+                else:
+                    self.assertEqual(writer.output, b"")
+
+    async def test_parent_player_data_requires_current_parent_membership_and_valid_record(self):
+        record = bytes(28)
+        for scenario in ("anonymous", "lobby-only", "left-parent", "wrong-size"):
+            with self.subTest(scenario=scenario):
+                peer = "192.0.2.3"
+                reader = asyncio.StreamReader()
+                if scenario != "anonymous":
+                    reader.feed_data(frame(0xd2, ["guest", "1", "", "", ""]))
+                if scenario in ("left-parent", "wrong-size"):
+                    reader.feed_data(frame(0xd1, ["23", ["1", "", "256"]]))
+                if scenario == "left-parent":
+                    reader.feed_data(frame(0xd1, ["42", [record]]))
+                    reader.feed_data(frame(0xd1, ["8", ["1"]]))
+                reader.feed_data(frame(0xd1, ["42", [bytes(29) if scenario == "wrong-size" else record]]))
+                reader.feed_eof()
+                writer = Writer(peer, 30010)
+                await router.handle(reader, writer, None, 1, Path("/unused"), "192.0.2.1", 30010,
+                                    {(peer, "guest"): time.monotonic() + 60}, {}, RoomRegistry(),
+                                    game_profile=GR2)
+                replies = []
+                offset = 0
+                while offset < len(writer.output):
+                    header = GSHeader.decode(writer.output[offset:offset + HEADER_SIZE])
+                    replies.append(data.decode(gsxor.decrypt(bytes(
+                        writer.output[offset + HEADER_SIZE:offset + header.size]))))
+                    offset += header.size
+                self.assertEqual(replies.count(["38", ["42"]]), int(scenario == "left-parent"))
+                if scenario == "left-parent":
+                    self.assertEqual(replies[-1], ["38", ["8", ["1"]]])
 
     async def test_heartbeats_return_on_each_authenticated_module_connection(self):
         # The wait and room connections have independent receive deadlines.

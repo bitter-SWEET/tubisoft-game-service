@@ -25,7 +25,7 @@ PATTERNS = {
 DOCUMENTATION_NETWORKS = tuple(ipaddress.IPv4Network(value) for value in
                              ("0.0.0.0/32", "127.0.0.0/8", "192.0.2.0/24", "198.51.100.0/24",
                               "203.0.113.0/24", "255.255.255.255/32"))
-FORBIDDEN_SUFFIXES = (".pem", ".key", ".pfx", ".p12", ".iso", ".ovl", ".umd", ".ps2", ".pcap", ".pcapng", ".log", ".raw", ".pyc", ".bin")
+FORBIDDEN_SUFFIXES = (".pem", ".key", ".pfx", ".p12", ".iso", ".ovl", ".umd", ".ps2", ".pcap", ".pcapng", ".log", ".raw", ".pyc", ".bin", ".irx", ".img", ".p2s", ".elf", ".soz", ".unpacked", ".lin", ".data")
 
 
 def candidate_files(root: Path, *, git: bool = False) -> list[Path]:

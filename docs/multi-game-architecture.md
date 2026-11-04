@@ -3,7 +3,8 @@
 Tubisoft runs multiple titles in one process, with one account database and one
 legacy GS key. A game profile supplies the title's wire dialect. XIII remains
 the default enabled game; Ghost Recon 2 is an opt-in development profile, with
-bootstrap and shared authentication plumbing but no implemented room flow.
+bootstrap, shared authentication and parent-directory discovery but no implemented
+dedicated gameplay server or match-joining flow.
 
 | Layer | Shared implementation | Per-game responsibility |
 | --- | --- | --- |
@@ -11,6 +12,7 @@ bootstrap and shared authentication plumbing but no implemented room flow.
 | Transport | `frame.py`, `data.py`, `gsxor.py`, `crypto.py`: GS framing, typed fields, legacy crypto | Confirm compatibility from the executable and live exchange |
 | Bootstrap | `bootstrap.py`: bounded HTTP parsing, product dispatch, health | INI section/key spelling and advertised listener ports |
 | Login/lobby | `router.py`: account operations, authentication handoffs, heartbeats, common GS envelopes | Parent records, registration parsing, supported operations, join endpoint and player-info codecs |
+| Proxy/rankings | `proxy.py`: service lookup/selection, expiring account authorizations, one-use redirect tickets, transport request envelopes | Declared service names, SDK version, application query validation and result-table schema |
 | Room lifecycle | `rooms.py`: pending/active state, membership, owner connection tracking, removal listeners | Registration metadata, advertisement flags; opaque game and score blobs |
 | Reliable UDP | `srp_probe.py`: checksum/padding, sequence ring, ACKs, retries, host sessions | Host operation validation, member notifications and update interpretation |
 | NAT | `nat.py`: correlated token/probe state, observed endpoints, bounded retries | Verify the title's request/callback dialect; no gameplay relay is implied |
@@ -20,6 +22,17 @@ bootstrap and shared authentication plumbing but no implemented room flow.
 XIII adapter is in `games/xiii.py`; `games/gr2.py` records GR2's verified identity
 and bootstrap dialect. The catalog is immutable. Unknown and duplicate game
 slugs, overlapping ports and invalid port numbers fail configuration validation.
+
+Discovery and game-room hosting are separate capabilities. Profile hooks for
+`login_notices`, `ranking_table`, `join_parent_lobby`, and `parent_player_info` cover GR2's sign-in
+and directory path while `supports_rooms` remains false. Ranking transport
+request IDs and the application IDs inside result tables are separate values;
+both must survive the shared/profile boundary. Empty ranking records currently
+use GR2's native unranked-player path; they do not provide persistent rankings.
+GR2 PS2 originally used dedicated gameplay servers; shared GS support and
+retained Create handlers do not establish a player-hosting flow. Its missing
+gameplay runtime must remain separate from the shared accounts/directory core.
+See the [retail menu and original architecture evidence](ghost-recon-2-network.md#retail-lobby-menu-and-dedicated-gameplay).
 
 ## Accounts stay global; sessions stay with their game
 
@@ -60,7 +73,7 @@ Production defaults are unchanged:
 | Profile | Product | Router TCP/host UDP | Launcher TCP | NAT UDP | Readiness |
 | --- | --- | --- | --- | --- | --- |
 | `xiii` | `XIIIPS2US` | 30000 | 30001 | 30002 | Existing open beta; client gameplay exercised |
-| `gr2` | `GHOSTRECON2PS2` | 30010 | 30011 | 30012 | Development only; native bootstrap mapped, room operations unavailable |
+| `gr2` | `GHOSTRECON2PS2` | 30010 | 30011 | 30012 | Experimental; shared login/lobby and worker join to Ready verified; full gameplay pending |
 
 For a local Python development instance, set `TUBISOFT_GAMES=xiii,gr2` plus the
 usual advertised address and state directory. XIII retains the existing
@@ -84,11 +97,13 @@ The optional PHP bridge forwards product requests to the canonical Python
 dispatcher rather than duplicating profile bodies.
 
 GR2's `[Servers]` section and CamelCase keys differ from XIII's sectionless,
-lower-case response. GR2's primary GS login constructor matches the common
-shape; full retail crypto/login interoperability remains to be tested. Unsupported
-GR2 lobby operations are closed with a metadata-only `UnsupportedOperation` log;
-the server does not send XIII room records or fabricated success. A client may
-show an error/timeout at that boundary. Enabling the profile does not establish
+lower-case response. A local retail GR2 run completed encrypted authentication
+with an existing XIII account. Discovery has a separate `supports_discovery`
+capability: it can return the GR2 parent folder while `supports_rooms` stays
+false. An explicit validated [worker integration](gr2-workers.md) enables dedicated discovery and joining. Without it, unsupported GR2 hosting/joining operations are closed with a metadata-only
+`UnsupportedOperation` log; the server does not send XIII room records or
+fabricated game success. A client may show an error/timeout at that boundary.
+Enabling the profile does not establish
 working GR2 multiplayer. See [the research evidence and missing messages](ghost-recon-2-network.md).
 
 ## Adding another title

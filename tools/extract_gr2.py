@@ -11,7 +11,8 @@ import struct
 import subprocess
 import zlib
 
-FILES = ("SYSTEM.CNF", "SLUS_211.05", "MP.SOZ", "SP.SOZ", "GVS.DAT", "GSROUTER.DAT")
+FILES = ("SYSTEM.CNF", "SLUS_211.05", "MP.SOZ", "SP.SOZ", "GVS.DAT", "GSROUTER.DAT",
+         "DNAS_R.OVL", "IRX/DNAS300.IMG")
 MAX_EXPANDED = 32 * 1024 * 1024
 
 

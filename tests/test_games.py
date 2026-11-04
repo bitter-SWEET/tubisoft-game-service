@@ -51,10 +51,18 @@ class ProfileTests(unittest.TestCase):
         registry = RoomRegistry()
         with self.assertRaises(UnsupportedOperation):
             registry.register("shared", "192.0.2.2", registration(GR2.product), GR2)
-        for operation in (GR2.parent_lobby, GR2.launcher_groups):
-            with self.assertRaises(UnsupportedOperation):
-                operation()
+        with self.assertRaises(UnsupportedOperation):
+            GR2.launcher_groups()
         self.assertEqual(registry.children(GR2.product), [])
+
+    def test_gr2_discovery_uses_its_own_product_and_fourteen_field_folder(self):
+        GR2.discovery_login(["GHOSTRECON2PS2"])
+        for fields in ([], [XIII.product], [GR2.product, "extra"]):
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                GR2.discovery_login(fields)
+        self.assertEqual(GR2.parent_lobby(), [
+            "0", "Ghost Recon 2", "1", "1", "0", "0", "1", "", "",
+            "GHOSTRECON2PS2", b"", "0", "8", "0"])
 
     def test_config_requires_explicit_known_titles_and_nonoverlapping_ports(self):
         env = {"TUBISOFT_ADVERTISE_IP": "192.0.2.1"}
@@ -67,6 +75,35 @@ class ProfileTests(unittest.TestCase):
                       {"TUBISOFT_GAMES": "gr2", "TUBISOFT_GR2_NAT_PORT": "65536"}):
             with self.subTest(extra=extra), self.assertRaises(ValueError):
                 service.configuration(env | extra)
+
+    def test_gr2_login_notices_use_the_native_language_and_two_string_record(self):
+        for language in ("en", "de", "fr", "es", "it"):
+            self.assertEqual(GR2.login_notices([language]), ["", ""])
+        for fields in ([], ["en", "extra"], [b"en"], [["en"]], ["unknown"]):
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                GR2.login_notices(fields)
+        with self.assertRaises(UnsupportedOperation):
+            XIII.login_notices(["en"])
+
+    def test_gr2_parent_join_is_independent_of_game_rooms_and_validates_its_fields(self):
+        self.assertFalse(GR2.supports_rooms)
+        for option in ("0", "1", "256", "4294967295"):
+            self.assertEqual(GR2.join_parent_lobby(["1", "", option]), ["1", ""])
+        for fields in ([], ["1", ""], ["1000", "", "0"], ["1", "password", "0"],
+                       ["1", "", b"0"], ["1", "", "-1"]):
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                GR2.join_parent_lobby(fields)
+        with self.assertRaises(UnsupportedOperation):
+            XIII.join_parent_lobby(["1", "", "0"])
+
+    def test_gr2_parent_player_data_matches_its_fixed_native_record_size(self):
+        record = bytes(range(28))
+        self.assertEqual(GR2.parent_player_info([record]), record)
+        for fields in ([], [record, record], ["text"], [bytes(27)], [bytes(29)]):
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                GR2.parent_player_info(fields)
+        with self.assertRaises(UnsupportedOperation):
+            XIII.parent_player_info([record])
 
 
 class BootstrapDispatchTests(unittest.IsolatedAsyncioTestCase):
@@ -97,11 +134,12 @@ class GSClient:
     def __init__(self, reader, writer):
         self.reader, self.writer = reader, writer
         self.key = bytes(range(16))
+        self.route = (1, 2)
 
     async def send(self, kind, fields=None, *, encrypted=False):
         body = b"" if fields is None else data.encode(fields)
         body = crypto.encrypt_payload(self.key, body) if encrypted else gsxor.encrypt(body)
-        self.writer.write(GSHeader(HEADER_SIZE + len(body), 2 if encrypted else 0, 1, kind, 1, 2).encode() + body)
+        self.writer.write(GSHeader(HEADER_SIZE + len(body), 2 if encrypted else 0, 1, kind, *self.route).encode() + body)
         await self.writer.drain()
 
     async def receive(self):
@@ -127,12 +165,26 @@ class MultiGameServiceTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as directory:
             # Reserve distinct ports until configuration is ready; no public listeners.
             reservations = []
+            ports = []
             try:
                 for _ in range(7):
-                    sock = socket.socket()
-                    sock.bind(("127.0.0.1", 0))
-                    reservations.append(sock)
-                ports = [sock.getsockname()[1] for sock in reservations]
+                    # Router/NAT listeners also use UDP; a TCP-only
+                    # reservation can select an existing UDP endpoint.
+                    for attempt in range(100):
+                        sock = socket.socket()
+                        sock.bind(("127.0.0.1", 0))
+                        datagram = socket.socket(type=socket.SOCK_DGRAM)
+                        try:
+                            datagram.bind(sock.getsockname())
+                        except OSError:
+                            sock.close()
+                            datagram.close()
+                            if attempt == 99:
+                                raise
+                            continue
+                        ports.append(sock.getsockname()[1])
+                        reservations.extend((sock, datagram))
+                        break
                 env = {"TUBISOFT_ADVERTISE_IP": "127.0.0.1", "TUBISOFT_BIND_IP": "127.0.0.1",
                        "TUBISOFT_STATE_DIR": directory, "TUBISOFT_GAMES": "xiii,gr2",
                        "TUBISOFT_HTTP_PORT": str(ports[6])}
@@ -174,7 +226,7 @@ class MultiGameServiceTests(unittest.IsolatedAsyncioTestCase):
                 header, fields = await xiii.receive()
                 self.assertEqual((header.message_type, fields), (0x26, [b"\x01"]))
                 gr2 = await connect(ports[3])
-                await gr2.send(0x66, ["SHAREDFIXTURE", "fixture-only", "1.0", b"\0"], encrypted=True)
+                await gr2.send(0x66, ["SHAREDFIXTURE", "fixture-only", GR2.sdk_version, b"\0"], encrypted=True)
                 header, fields = await gr2.receive()
                 self.assertEqual((header.message_type, fields), (0x26, [b"\x66"]))
                 await gr2.send(0x5d)
@@ -191,14 +243,130 @@ class MultiGameServiceTests(unittest.IsolatedAsyncioTestCase):
                 await wait.send(0x3a)
                 header, fields = await wait.receive()
                 self.assertEqual((header.message_type, fields), (0x3a, []))
-                # Unimplemented GR2 lobby operations never receive XIII's records.
-                await wait.send(0xd1, ["21", []])
-                self.assertEqual(await asyncio.wait_for(wait.reader.read(), 2), b"")
+                # Discovery works independently from still-unimplemented rooms.
+                await wait.send(0xd1, ["21", [GR2.product]])
+                header, fields = await wait.receive()
+                self.assertEqual((header.message_type, fields), (0xd1, ["38", ["21"]]))
+                _, fields = await wait.receive()
+                self.assertEqual(fields, ["53", ["1", "256", ["0"], [GR2.parent_lobby()]]])
+                # GR2's observed startup continues through friends login and
+                # an empty ignore-list request before requesting player info.
+                await wait.send(0x4e, [bytes(4), (1).to_bytes(4, "little")])
+                header, fields = await wait.receive()
+                self.assertEqual((header.message_type, fields), (0x26, [b"\x4e"]))
+                await wait.send(0x54)
+                header, fields = await wait.receive()
+                self.assertEqual((header.message_type, fields), (0x26, [b"\x54"]))
+                self.assertEqual((header.sender, header.receiver), (2, 1))
+                await wait.send(0x13, ["SharedFixture"])
+                _, fields = await wait.receive()
+                self.assertEqual(fields, [b"\x13", ["SharedFixture", "SharedFixture", "", "", "", "", ""]])
+                await wait.send(0xde, ["en"])
+                header, fields = await wait.receive()
+                self.assertEqual((header.message_type, fields), (0x26, [b"\xde", ["", ""]]))
+                self.assertEqual((header.sender, header.receiver), (2, 1))
+                await wait.send(0x3a)
+                header, fields = await wait.receive()
+                self.assertEqual((header.message_type, fields), (0x3a, []))
+                # GR2 looks up ladderquery, selects a proxy, verifies the
+                # verified account grant, redirects, then redeems a ticket.
+                await wait.send(0xcc, ["1", ["ladderquery", "0", "0"]])
+                header, fields = await wait.receive()
+                self.assertEqual((header.message_type, fields), (0xcc, ["38", ["1", [
+                    "ladderquery", "0", "0", [["1", "127.0.0.1", str(ports[3])]]]]]))
+                await wait.send(0xcc, ["2", ["1"]])
+                _, fields = await wait.receive()
+                self.assertEqual(fields, ["38", ["2", ["1"]]])
+
+                async def proxy_client(port):
+                    client = GSClient(*await asyncio.open_connection("127.0.0.1", port))
+                    client.route = (8, 11)
+                    clients.append(client)
+                    return client
+
+                bad = await proxy_client(ports[3])
+                await bad.send(0x66, ["SharedFixture", "wrong-fixture"])
+                self.assertEqual(await asyncio.wait_for(bad.reader.read(), 2), b"")
+                other_account = await proxy_client(ports[3])
+                await other_account.send(0x66, ["OtherFixture", GR2.sdk_version])
+                self.assertEqual(await asyncio.wait_for(other_account.reader.read(), 2), b"")
+                login = await proxy_client(ports[3])
+                await login.send(0x66, ["SharedFixture", GR2.sdk_version])
+                header, fields = await login.receive()
+                self.assertEqual((header.message_type, fields), (0x26, [b"\x66", []]))
+                reused_grant = await proxy_client(ports[3])
+                await reused_grant.send(0x66, ["SharedFixture", GR2.sdk_version])
+                self.assertEqual(await asyncio.wait_for(reused_grant.reader.read(), 2), b"")
+                await login.send(0x5d)
+                header, fields = await login.receive()
+                ticket = fields[1][0]
+                self.assertEqual((header.message_type, fields[0], fields[1][1:]),
+                                 (0x26, b"\x5d", ["127.0.0.1", str(ports[3])]))
+                self.assertLessEqual(len(ticket.encode()), 15)
+                login.writer.close()
+                await login.writer.wait_closed()
+                wrong_title = await proxy_client(ports[0])
+                await wrong_title.send(0x4d, [ticket])
+                self.assertEqual(await asyncio.wait_for(wrong_title.reader.read(), 2), b"")
+                ranking = await proxy_client(ports[3])
+                await ranking.send(0x4d, [ticket])
+                header, fields = await ranking.receive()
+                self.assertEqual((header.message_type, fields), (0x26, [b"\x4d", []]))
+                replay = await proxy_client(ports[3])
+                await replay.send(0x4d, [ticket])
+                self.assertEqual(await asyncio.wait_for(replay.reader.read(), 2), b"")
+                await wait.send(0xcc, [["3", "1"]])
+                await wait.send(0x3a)
+                header, fields = await wait.receive()
+                self.assertEqual((header.message_type, fields), (0x3a, []))
+                # Distinct application and transport IDs; the result must
+                # preserve the transport ID used by the native result map.
+                for index in range(10):
+                    query = ["1", [str(100 + index), GR2.product, "0", str(index % 5),
+                                   ["4", ["SharedFixture"]], [[], [], []]]]
+                    await ranking.send(0xcc, ["1281", str(index + 1), query])
+                    header, fields = await ranking.receive()
+                    self.assertEqual((header.message_type, fields), (0xcc, [
+                        "1281", str(index + 1), ["38", ["1", [str(100 + index), "0", [], []]]]]))
+                    self.assertEqual((header.sender, header.receiver), (11, 8))
+                await ranking.send(0x3a)
+                header, fields = await ranking.receive()
+                self.assertEqual((header.message_type, fields), (0x3a, []))
+                await wait.send(0xd1, ["3", ["1"]])
+                _, fields = await wait.receive()
+                self.assertEqual(fields, ["38", ["3", ["1", "127.0.0.1", str(ports[3])]]])
+                lobby = await connect(ports[3])
+                await lobby.send(0xd2, ["SharedFixture", "1", "1.0", "", "0"])
+                _, fields = await lobby.receive()
+                self.assertEqual(fields, ["210", ["1"]])
+                await lobby.send(0xd1, ["23", ["1", "", "0"]])
+                header, fields = await lobby.receive()
+                self.assertEqual((header.message_type, fields), (0xd1, ["38", ["23", ["1", ""]]]))
+                _, fields = await lobby.receive()
+                self.assertEqual(fields, ["53", ["1", "256", GR2.parent_lobby(), []]])
+                # GR2's parent-join callback immediately publishes its
+                # 28-byte player record, then waits for operation 42.
+                for record in (bytes(range(28)), bytes(reversed(range(28)))):
+                    await lobby.send(0xd1, ["42", [record]])
+                    header, fields = await lobby.receive()
+                    self.assertEqual((header.message_type, fields), (0xd1, ["38", ["42"]]))
+                await lobby.send(0xd1, ["9", ["1"]])
+                _, fields = await lobby.receive()
+                self.assertEqual(fields, ["53", ["1", "256", GR2.parent_lobby(), []]])
+                await lobby.send(0x3a)
+                header, _ = await lobby.receive()
+                self.assertEqual(header.message_type, 0x3a)
+                await lobby.send(0xd1, ["24", ["1000", "", "0", "0", GR2.product]])
+                self.assertEqual(await asyncio.wait_for(lobby.reader.read(), 2), b"")
                 with closing(sqlite3.connect(args.account_db)) as db:
                     self.assertEqual(db.execute("SELECT COUNT(*) FROM accounts").fetchone()[0], 1)
                 self.assertTrue(await asyncio.to_thread(accounts.verify_account, args.account_db,
                                                        "SharedFixture", "fixture-only"))
                 self.assertEqual(list(Path(directory).glob("*.sqlite3")), [args.account_db])
+                # Router authentication does not substitute for the separate
+                # lobby-server handoff and login required by operation 23.
+                await wait.send(0xd1, ["23", ["1", "", "0"]])
+                self.assertEqual(await asyncio.wait_for(wait.reader.read(), 2), b"")
             finally:
                 for client in clients:
                     client.writer.close()

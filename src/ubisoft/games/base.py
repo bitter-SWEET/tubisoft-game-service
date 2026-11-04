@@ -38,6 +38,8 @@ class GameProfile:
     sdk_version: str
     default_ports: tuple[int, int, int]
     supports_rooms: bool = False
+    supports_discovery: bool = False
+    proxy_services: tuple[str, ...] = ()
     bootstrap_section: str | None = None
     bootstrap_keys: tuple[str, ...] = (
         "routerip0", "routerport0", "routerlauncherport0", "natserverip0", "natserverport0")
@@ -55,6 +57,25 @@ class GameProfile:
         if not self.supports_rooms:
             raise UnsupportedOperation(f"{self.slug} room operations are not implemented")
 
+    def require_discovery(self) -> None:
+        if not (self.supports_discovery or self.supports_rooms):
+            raise UnsupportedOperation(f"{self.slug} discovery is not implemented")
+
+    def discovery_login(self, fields: list) -> None:
+        self.require_discovery()
+
+    def join_parent_lobby(self, fields: list) -> list:
+        raise UnsupportedOperation(f"{self.slug} parent lobby join is not implemented")
+
+    def parent_player_info(self, fields: list) -> bytes:
+        raise UnsupportedOperation(f"{self.slug} parent player data is not implemented")
+
+    def login_notices(self, fields: list) -> list:
+        raise UnsupportedOperation(f"{self.slug} login notices are not implemented")
+
+    def ranking_table(self, fields: list, username: str) -> list:
+        raise UnsupportedOperation(f"{self.slug} ranking queries are not implemented")
+
     def registration(self, fields: list, peer_ip: str) -> RoomSpec:
         raise UnsupportedOperation(f"{self.slug} registration is not implemented")
 
@@ -69,6 +90,12 @@ class GameProfile:
 
     def game_started_fields(self, room: Room) -> list:
         raise UnsupportedOperation(f"{self.slug} join completion is not implemented")
+
+    def room_join_result(self, room: Room) -> list:
+        return [str(room.room_id)]
+
+    def game_connected(self, room: Room, fields: list) -> None:
+        raise UnsupportedOperation(f"{self.slug} game-connected notification is not implemented")
 
     def player_port(self, info: bytes) -> int:
         raise UnsupportedOperation(f"{self.slug} player info is not implemented")

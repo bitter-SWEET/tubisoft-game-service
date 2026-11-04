@@ -17,8 +17,9 @@ class PublicationTests(unittest.TestCase):
                 fixture.write_text(content)
                 self.assertIn((1, label), inspect(fixture))
                 self.assertNotIn(content, str(inspect(fixture)))
-            artifact = root / "accounts.sqlite3"
-            artifact.write_bytes(b"fixture")
-            self.assertEqual(inspect(artifact), [(0, "private/runtime artifact filename")])
+            for filename in ("accounts.sqlite3", "COMMON.LIN", "asset-cache.data"):
+                artifact = root / filename
+                artifact.write_bytes(b"fixture")
+                self.assertEqual(inspect(artifact), [(0, "private/runtime artifact filename")])
             fixture.write_text("Use documentation address 192.0.2.10 and loopback 127.0.0.1.")
             self.assertEqual(inspect(fixture), [])

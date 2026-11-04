@@ -31,6 +31,13 @@ __pycache__/
 *.umd
 *.ps2
 *.bin
+*.elf
+*.soz
+*.SOZ
+*.unpacked
+*.lin
+*.LIN
+*.data
 /.agents/
 /.aws/
 /.codex/

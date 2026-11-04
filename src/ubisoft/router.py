@@ -15,7 +15,7 @@ from pathlib import Path
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from . import accounts, crypto, data, gsxor, nat, rooms, srp_probe
+from . import accounts, crypto, data, gsxor, nat, proxy, rooms, srp_probe
 from .bootstrap import port_number
 from .frame import GSHeader, HEADER_SIZE, read_frame
 from .games.base import GameProfile
@@ -53,7 +53,8 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                  registry: rooms.RoomRegistry,
                  host_probe: srp_probe.Probe | None = None,
                  access_policy: AccessPolicy | None = None,
-                 game_profile: GameProfile = XIII) -> None:
+                 game_profile: GameProfile = XIII,
+                 proxy_handoffs: proxy.Handoffs | None = None) -> None:
     peer = writer.get_extra_info("peername")
     local = writer.get_extra_info("sockname")
     LOG.info("connected game=%s peer=%s local=%s", game_profile.slug, peer, local)
@@ -62,6 +63,14 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
     server_key: bytes | None = None
     logged_in_user: str | None = None
     wait_user: str | None = None
+    lobby_logged_in = False
+    joined_parent = False
+    parent_info: bytes | None = None
+    friends_logged_in = False
+    proxy_user: str | None = None
+    proxy_ready = False
+    proxy_directory = proxy.Directory(game_profile, wait_host, wait_port)
+    proxy_handoffs = proxy_handoffs if proxy_handoffs is not None else proxy.Handoffs()
     host_room: rooms.Room | None = None
     host_connection = object()
     joined_room: rooms.Room | None = None
@@ -192,11 +201,38 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                         continue
                     LOG.info("launcher credentials rejected peer=%s", peer)
             else:
+                proxy_route = (header.sender, header.receiver) == (8, 11) and bool(game_profile.proxy_services)
+                if (proxy_route and header.property == 0 and header.message_type == 0x5d
+                        and not payload and proxy_user is not None and not proxy_ready):
+                    ticket = proxy_handoffs.issue(peer[0], proxy_user)
+                    payload = gsxor.encrypt(data.encode([b"\x5d", [ticket, wait_host, str(wait_port)]]))
+                    writer.write(response_header(header, payload, 0x26) + payload)
+                    await writer.drain()
+                    LOG.info("proxy redirect sent game=%s peer=%s", game_profile.slug, peer)
+                    continue
+                if (proxy_route and header.property == 0 and header.message_type == 0x3a
+                        and not payload and proxy_ready):
+                    writer.write(response_header(header, b""))
+                    await writer.drain()
+                    LOG.info("proxy heartbeat game=%s peer=%s", game_profile.slug, peer)
+                    continue
                 if (header.property == 0 and header.message_type == 0x5c
                         and not payload and wait_user is not None):
                     # Friends-disconnect is separate from router logout.
                     # 0x01d6cbd0 sends an empty message without awaiting a result.
+                    friends_logged_in = False
                     LOG.info("friends channel disconnected peer=%s; sign-in session retained", peer)
+                    continue
+                if (header.property == 0 and header.message_type == 0x54
+                        and not payload and wait_user is not None and friends_logged_in):
+                    # GR2 0x004cece0 requests the ignore list with an empty
+                    # body. Its completion reader (0x004cf740/0x004cc1a0)
+                    # accepts GSSUCCESS containing only the binary operation
+                    # ID. With no stored ignore entries, no item events follow.
+                    payload = gsxor.encrypt(data.encode([b"\x54"]))
+                    writer.write(response_header(header, payload, 0x26) + payload)
+                    await writer.drain()
+                    LOG.info("empty ignore list completed game=%s peer=%s", game_profile.slug, peer)
                     continue
                 if (header.property == 0 and header.message_type == 0x3a
                         and not payload and wait_user is not None):
@@ -225,6 +261,56 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                         fields = data.decode(gsxor.decrypt(payload))
                         LOG.info("plain message structure peer=%s count=%d field_types=%s", peer,
                                  len(fields), [type(field).__name__ for field in fields])
+                        if (proxy_route and header.message_type == 0x66
+                                and proxy_user is None and wait_user is None
+                                and len(fields) == 2 and all(isinstance(field, str) for field in fields)):
+                            if access_policy is not None and not access_policy.allow_authentication(peer[0]):
+                                LOG.info("proxy login throttled game=%s peer=%s", game_profile.slug, peer)
+                                break
+                            # 0x004c8740 stores username at SDK+4, password at
+                            # +0x14, and version at +0x25. Proxy setup passes
+                            # +4/+0x25, so these are USERNAME/VERSION. Redeem
+                            # the exact account's prior verified selection.
+                            if not proxy_handoffs.consume_login(peer[0], fields[0], fields[1]):
+                                LOG.info("proxy login grant rejected game=%s peer=%s", game_profile.slug, peer)
+                                break
+                            proxy_user = fields[0].casefold()
+                            payload = gsxor.encrypt(data.encode([b"\x66", []]))
+                            writer.write(response_header(header, payload, 0x26) + payload)
+                            await writer.drain()
+                            LOG.info("proxy login grant accepted game=%s peer=%s", game_profile.slug, peer)
+                            continue
+                        if (proxy_route and header.message_type == 0x4d
+                                and proxy_user is None and wait_user is None
+                                and len(fields) == 1 and isinstance(fields[0], str)):
+                            proxy_user = proxy_handoffs.redeem(peer[0], fields[0])
+                            if proxy_user is None:
+                                LOG.info("proxy ticket rejected game=%s peer=%s", game_profile.slug, peer)
+                                break
+                            proxy_ready = True
+                            payload = gsxor.encrypt(data.encode([b"\x4d", []]))
+                            writer.write(response_header(header, payload, 0x26) + payload)
+                            await writer.drain()
+                            LOG.info("proxy ticket accepted game=%s peer=%s", game_profile.slug, peer)
+                            continue
+                        if header.message_type == 0xcc and wait_user is not None and not proxy_route:
+                            reply = proxy_directory.reply(fields)
+                            if fields[0] == "2":
+                                proxy_handoffs.authorize_login(peer[0], wait_user, game_profile.sdk_version)
+                            if reply is not None:
+                                writer.write(make_frame(header, reply))
+                                await writer.drain()
+                            LOG.info("proxy directory handled game=%s peer=%s operation=%s",
+                                     game_profile.slug, peer,
+                                     fields[0][0] if isinstance(fields[0], list) else fields[0])
+                            continue
+                        if proxy_route and header.message_type == 0xcc and proxy_ready:
+                            reply = proxy.query_reply(game_profile, fields, proxy_user)
+                            writer.write(make_frame(header, reply))
+                            await writer.drain()
+                            LOG.info("empty ranking result game=%s peer=%s operation=%s request=%s",
+                                     game_profile.slug, peer, fields[0], fields[1])
+                            continue
                         if (header.message_type == 0xd9 and local[1] != wait_port
                                 and logged_in_user is not None and len(fields) == 2
                                 and all(isinstance(field, str) for field in fields)):
@@ -270,7 +356,10 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                         elif (header.message_type == 0xd2 and len(fields) >= 2
                               and isinstance(fields[0], str)
                               and isinstance(fields[1], (str, bytes))):
-                            game_profile.require_rooms()
+                            if len(fields) == 2:
+                                game_profile.require_rooms()
+                            else:
+                                game_profile.require_discovery()
                             key = (peer[0], fields[0].casefold())
                             expiry = pending_handoffs.pop(key, 0)
                             if expiry > time.monotonic():
@@ -291,8 +380,18 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                 await writer.drain()
                                 wait_user = fields[0]
                                 LOG.info("lobby server login accepted peer=%s", peer)
+                                lobby_logged_in = True
+                                joined_parent = False
+                                parent_info = None
                                 continue
                             LOG.info("lobby server login rejected peer=%s: no pending handoff", peer)
+                        elif header.message_type == 0xde and wait_user is not None:
+                            notices = game_profile.login_notices(fields)
+                            payload = gsxor.encrypt(data.encode([b"\xde", notices]))
+                            writer.write(response_header(header, payload, 0x26) + payload)
+                            await writer.drain()
+                            LOG.info("login notices sent game=%s peer=%s", game_profile.slug, peer)
+                            continue
                         elif (header.message_type == 0x13 and wait_user is not None
                               and len(fields) == 1 and isinstance(fields[0], str)
                               and fields[0].casefold() == wait_user.casefold()):
@@ -305,11 +404,12 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                         elif (header.message_type == 0x4e and wait_user is not None
                               and len(fields) == 2
                               and all(isinstance(field, bytes) and len(field) == 4 for field in fields)):
-                            # Friends operations are not implemented; accept the
-                            # login so this optional channel stays connected.
+                            # The shared presence channel supports login and an
+                            # empty ignore list; other operations remain explicit.
                             payload = gsxor.encrypt(data.encode([b"\x4e"]))
                             writer.write(response_header(header, payload, 0x26) + payload)
                             await writer.drain()
+                            friends_logged_in = True
                             LOG.info("experimental friends login accepted peer=%s", peer)
                             continue
                         elif (header.message_type == 0xd1 and wait_user is not None
@@ -317,10 +417,17 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                               and isinstance(fields[1], list)
                               and fields[0].isascii() and fields[0].isdigit()
                               and len(fields[0]) <= 3):
-                            game_profile.require_rooms()
                             subtype = int(fields[0])
-                            LOG.info("lobby request peer=%s subtype=%d", peer, subtype)
+                            LOG.info("lobby request game=%s peer=%s subtype=%d nested_types=%s",
+                                     game_profile.slug, peer, subtype,
+                                     [type(item).__name__ for item in fields[1]])
+                            if subtype in (21, 3, 9, 8, 23) or (
+                                    subtype == 42 and joined_parent and joined_room is None):
+                                game_profile.require_discovery()
+                            else:
+                                game_profile.require_rooms()
                             if subtype == 21:
+                                game_profile.discovery_login(fields[1])
                                 payload = gsxor.encrypt(data.encode(["38", ["21"]]))
                                 writer.write(response_header(header, payload, 0xd1) + payload)
                                 # The title adapter supplies its tested parent record.
@@ -346,6 +453,36 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                 writer.write(response_header(header, payload, 0xd1) + payload)
                                 await writer.drain()
                                 LOG.info("lobby group sent peer=%s active_rooms=%d", peer, len(registry.children(game_profile.product)))
+                                continue
+                            if subtype == 23:
+                                if not lobby_logged_in:
+                                    raise ValueError("parent join requires lobby server login")
+                                result = game_profile.join_parent_lobby(fields[1])
+                                joined_parent = True
+                                parent_info = None
+                                payload = gsxor.encrypt(data.encode(["38", ["23", result]]))
+                                writer.write(response_header(header, payload, 0xd1) + payload)
+                                # The parent exists even when there are no
+                                # hosted games. This is directory membership,
+                                # not registration of a synthetic game room.
+                                children = registry.children(game_profile.product)
+                                payload = gsxor.encrypt(data.encode(["53", [
+                                    "1", "256", game_profile.parent_lobby(), children]]))
+                                writer.write(response_header(header, payload, 0xd1) + payload)
+                                await writer.drain()
+                                LOG.info("parent lobby join accepted game=%s peer=%s active_rooms=%d",
+                                         game_profile.slug, peer, len(children))
+                                continue
+                            if subtype == 42 and joined_parent and joined_room is None:
+                                parent_info = game_profile.parent_player_info(fields[1])
+                                # 0x004db070 delegates to the common lobby
+                                # success parser; no game endpoint belongs
+                                # in this directory-level completion.
+                                payload = gsxor.encrypt(data.encode(["38", ["42"]]))
+                                writer.write(response_header(header, payload, 0xd1) + payload)
+                                await writer.drain()
+                                LOG.info("parent player data updated game=%s peer=%s bytes=%d",
+                                         game_profile.slug, peer, len(parent_info))
                                 continue
                             if (subtype == 24 and len(fields[1]) == 5
                                     and all(isinstance(item, str) for item in fields[1])):
@@ -374,7 +511,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                 host_member_notified = False
                                 # XIII parser 0x01d72af0 expects the room ID in
                                 # the inner list of this lobby-success envelope.
-                                payload = gsxor.encrypt(data.encode(["38", ["24", [str(room.room_id)]]]))
+                                payload = gsxor.encrypt(data.encode(["38", ["24", game_profile.room_join_result(room)]]))
                                 writer.write(response_header(header, payload, 0xd1) + payload)
                                 # Populate the room record; this is separate
                                 # from the GAME_STARTED join-completion event.
@@ -395,6 +532,13 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                 await writer.drain()
                                 LOG.info("additional room info sent peer=%s room=%d", peer, room.room_id)
                                 continue
+                            if subtype == 34 and joined_room is not None:
+                                if registry.active_room(joined_room.room_id, game_profile.product) is not joined_room:
+                                    raise ValueError('game-connected worker unavailable')
+                                game_profile.game_connected(joined_room, fields[1])
+                                LOG.info('game connection reported game=%s peer=%s room=%d; GS session retained',
+                                         game_profile.slug, peer, joined_room.room_id)
+                                continue
                             if (subtype == 42 and joined_room is not None and len(fields[1]) == 1
                                     and isinstance(fields[1][0], bytes) and len(fields[1][0]) <= 16384):
                                 if registry.active_room(joined_room.room_id) is not joined_room:
@@ -402,7 +546,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                     break
                                 joined_room.member_info[(peer[0], wait_user.casefold())] = fields[1][0]
                                 is_owner = (peer[0], wait_user.casefold()) == (joined_room.peer_ip, joined_room.owner)
-                                if host_probe is not None and not is_owner:
+                                if host_probe is not None and not is_owner and not joined_room.dedicated:
                                     guest_port = joined_room.profile.player_port(fields[1][0])
                                     notified = host_probe.member_info(joined_room, wait_user, peer[0],
                                                                       fields[1][0], new=not host_member_notified)
@@ -436,6 +580,9 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                 if group_id not in allowed:
                                     LOG.info("room leave ignored peer=%s: group not associated with this session", peer)
                                     continue
+                                if group_id in ("0", "1"):
+                                    joined_parent = False
+                                    parent_info = None
                                 if joined_room is not None:
                                     joined_room.members.discard((peer[0], wait_user.casefold()))
                                     joined_room.member_info.pop((peer[0], wait_user.casefold()), None)
@@ -486,6 +633,11 @@ async def serve(args: argparse.Namespace) -> None:
     authenticated: dict[tuple[str, str], float] = {}
     registry = rooms.RoomRegistry()
     game_profile = getattr(args, "game_profile", XIII)
+    worker_path = getattr(args, "worker_state", None)
+    if worker_path is not None:
+        from .gr2_worker import read_worker
+        registry.worker_provider = lambda: read_worker(worker_path, game_profile)
+    proxy_handoffs = proxy.Handoffs()
     host_probe = srp_probe.Probe(pending_handoffs, registry, game_profile)
     advertise_ip = getattr(args, "advertise_ip", None) or args.bind
     access_policy = getattr(args, "access_policy", None)
@@ -497,7 +649,8 @@ async def serve(args: argparse.Namespace) -> None:
             return
         try:
             await handle(reader, writer, key, args.timeout, args.account_db, advertise_ip, args.port,
-                         pending_handoffs, authenticated, registry, host_probe, access_policy, game_profile)
+                         pending_handoffs, authenticated, registry, host_probe, access_policy, game_profile,
+                         proxy_handoffs)
         finally:
             if access_policy is not None:
                 access_policy.release(peer_ip)
@@ -505,7 +658,14 @@ async def serve(args: argparse.Namespace) -> None:
     launcher = None
     udp_transport = None
     nat_transport = None
+    worker_task = None
     try:
+        if worker_path is not None:
+            async def watch_worker():
+                while True:
+                    registry.sync_worker()
+                    await asyncio.sleep(1)
+            worker_task = asyncio.create_task(watch_worker())
         udp_transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
             lambda: host_probe, local_addr=(args.bind, args.port))
         if args.nat_port:
@@ -517,6 +677,9 @@ async def serve(args: argparse.Namespace) -> None:
         LOG.info("router handshake listening at %s", server.sockets[0].getsockname())
         await server.serve_forever()
     finally:
+        if worker_task is not None:
+            worker_task.cancel()
+            await asyncio.gather(worker_task, return_exceptions=True)
         server.close()
         await server.wait_closed()
         if udp_transport is not None:
