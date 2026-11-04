@@ -539,6 +539,13 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                 LOG.info('game connection reported game=%s peer=%s room=%d; GS session retained',
                                          game_profile.slug, peer, joined_room.room_id)
                                 continue
+                            if subtype == 70 and joined_room is not None:
+                                game_profile.game_transition(joined_room, fields[1])
+                                # This report does not leave the directory room
+                                # or sign out. No native completion is consumed.
+                                LOG.info('game transition reported game=%s peer=%s room=%d; GS session retained',
+                                         game_profile.slug, peer, joined_room.room_id)
+                                continue
                             if (subtype == 42 and joined_room is not None and len(fields[1]) == 1
                                     and isinstance(fields[1][0], bytes) and len(fields[1][0]) <= 16384):
                                 if registry.active_room(joined_room.room_id) is not joined_room:

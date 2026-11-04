@@ -84,6 +84,17 @@ fabricated completion event. Worker expiry sends room removal while keeping
 account sign-in alive. Shared socket tests cover listing, join, endpoint,
 post-join heartbeat, worker restart and expiry.
 
+At the observed round boundary, GR2 sends one-way operation 70 with its joined
+room ID. The native call chain is `0x003de860` → `0x004c61e0` → `0x004d23a0`;
+the SDK dispatcher at `0x004c8e70` has no operation-70 completion. Tubisoft
+validates the report against this connection's dedicated GR2 room and retains
+the GS session and room membership. Operation 8 remains the explicit leave.
+Previously operation 70 fell through the unsupported-message path, closing
+every reporting client's GS connection even though the gameplay worker stayed
+alive. Socket regression tests cover simultaneous members, repeated reports,
+heartbeat continuity and leave/rejoin. Retail continuation into a second round
+still needs verification; this does not resolve native simulation performance.
+
 Ranks currently return empty tables using the requested query IDs. Friends,
 complete ranking writes, all GS operations and normal retail game teardown
 remain incomplete. This integration is an experimental beta, with gameplay

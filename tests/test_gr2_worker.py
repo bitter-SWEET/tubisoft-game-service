@@ -10,6 +10,7 @@ import unittest
 
 from ubisoft import router, service
 from ubisoft.games.registry import GR2, XIII
+from ubisoft.games.base import UnsupportedOperation
 from ubisoft.gr2_worker import SCHEMA, game_description, read_worker
 from ubisoft.rooms import RoomRegistry
 from test_games import GSClient
@@ -24,6 +25,26 @@ def record(now=100):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_round_report_is_scoped_to_gr2_and_the_joined_dedicated_room(self):
+        registry = RoomRegistry()
+        # Use a genuine validated worker room, without any account state.
+        with TemporaryDirectory() as directory:
+            path = Path(directory)/'worker.json'
+            path.write_text(json.dumps(record()))
+            registry.worker_provider = lambda: read_worker(path, PROFILE, 100)
+            room_id = int(registry.children(GR2.product)[0][2])
+            room = registry.active_room(room_id, GR2.product)
+            PROFILE.game_transition(room, [str(room_id)])
+            for fields in ([], ['1'], [room_id], [str(room_id), 'extra'], [b'1000']):
+                with self.subTest(fields=fields), self.assertRaises(ValueError):
+                    PROFILE.game_transition(room, fields)
+            with self.assertRaises(ValueError):
+                GR2.game_transition(room, [str(room_id)])
+            with self.assertRaises(ValueError):
+                PROFILE.game_transition(replace(room, dedicated=False), [str(room_id)])
+            with self.assertRaises(UnsupportedOperation):
+                XIII.game_transition(room, [str(room_id)])
+
     def test_native_description_layout_clears_password_and_sets_real_endpoint(self):
         source = bytearray(84)
         source[16:32] = b'private-fixture!'
@@ -111,6 +132,36 @@ class WorkerSocketTests(unittest.IsolatedAsyncioTestCase):
                 await client.send(0xd1,['34',[roomid]])
                 await client.send(0x3a)
                 header,_=await client.receive();self.assertEqual(header.message_type,0x3a)
+                # Both retail clients sent operation 70 at the same round
+                # boundary. It formerly fell through and closed GS sockets.
+                pending[('127.0.0.1','otherfixture')] = time.monotonic()+120
+                other = GSClient(*await asyncio.open_connection('127.0.0.1',port))
+                try:
+                    await other.handshake(private)
+                    await other.send(0xd2,['OtherFixture','1','1.0','','0'])
+                    _,fields=await other.receive();self.assertEqual(fields,['210',['1']])
+                    await other.send(0xd1,['24',[roomid,'','0','0',GR2.product]])
+                    await other.receive();await other.receive()
+                    room=registry.active_room(int(roomid),GR2.product)
+                    self.assertEqual(len(room.members),2)
+                    for _ in range(2):
+                        for joined in (client,other):
+                            await joined.send(0xd1,['70',[roomid]])
+                            await joined.send(0x3a)
+                            header,fields=await joined.receive()
+                            # No fabricated operation-70 ACK precedes the
+                            # heartbeat, and neither connection reaches EOF.
+                            self.assertEqual((header.message_type,fields),(0x3a,[]))
+                        self.assertEqual(len(room.members),2)
+                        self.assertIs(registry.active_room(int(roomid),GR2.product),room)
+                    await client.send(0xd1,['8',[roomid]])
+                    _,fields=await client.receive();self.assertEqual(fields,['38',['8',[roomid]]])
+                    self.assertEqual(len(room.members),1)
+                    await client.send(0xd1,['24',[roomid,'','0','0',GR2.product]])
+                    await client.receive();await client.receive()
+                    self.assertEqual(len(room.members),2)
+                finally:
+                    other.writer.close();await other.writer.wait_closed()
                 state.unlink();registry.sync_worker()
                 _,fields=await client.receive();self.assertEqual(fields,['55',[roomid]])
                 await client.send(0x3a)

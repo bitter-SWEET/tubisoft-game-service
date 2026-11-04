@@ -97,6 +97,9 @@ class GameProfile:
     def game_connected(self, room: Room, fields: list) -> None:
         raise UnsupportedOperation(f"{self.slug} game-connected notification is not implemented")
 
+    def game_transition(self, room: Room, fields: list) -> None:
+        raise UnsupportedOperation(f"{self.slug} game-transition notification is not implemented")
+
     def player_port(self, info: bytes) -> int:
         raise UnsupportedOperation(f"{self.slug} player info is not implemented")
 

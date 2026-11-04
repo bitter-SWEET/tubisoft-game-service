@@ -29,6 +29,15 @@ class GR2Profile(GameProfile):
         if not room.dedicated or fields != [str(room.room_id)]:
             raise ValueError('invalid GR2 game-connected room')
 
+    def game_transition(self, room, fields: list) -> None:
+        # 0x003de860 -> 0x004c61e0 -> 0x004d23a0 sends operation 70
+        # with the room ID at the observed round boundary. Like operation
+        # 34, it has no completion in the SDK dispatcher 0x004c8e70.
+        # It is distinct from operation 8 (leaving the room).
+        self.require_rooms()
+        if not room.dedicated or fields != [str(room.room_id)]:
+            raise ValueError('invalid GR2 game-transition room')
+
     def parent_player_info(self, fields: list) -> bytes:
         # 0x003e1430 calls 0x003dd930 after parent-join success. It
         # publishes exactly 0x1c bytes from the player's GS record.
