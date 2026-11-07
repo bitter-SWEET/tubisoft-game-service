@@ -83,6 +83,7 @@ class RoomRegistry:
                 self._next_id += 1
                 self._worker_id = current.room_id
                 self._rooms[current.room_id] = current
+            current.name = worker['spec'].name
             current.info = worker['spec'].info
             current.additional_info = worker['spec'].additional_info
             current.peer_ip = worker['address']

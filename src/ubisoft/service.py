@@ -16,6 +16,8 @@ import subprocess
 from types import SimpleNamespace
 
 from . import accounts, bootstrap, router
+from .ladder import LadderStore
+from . import results_api
 from .access import AccessPolicy, networks
 from .games.registry import bindings
 
@@ -67,8 +69,14 @@ def configuration(environment=None):
         if not 1 <= value <= 65535:
             raise ValueError("invalid service port")
         return value
+    results_keyring=env.get('TUBISOFT_RESULTS_KEYRING')
+    if bool(results_keyring)!=bool(env.get('TUBISOFT_RESULTS_PORT')):
+        raise ValueError('Configure results port and private worker keyring together')
     return SimpleNamespace(
         games=bindings(env),
+        native_rankings=env.get('TUBISOFT_NATIVE_RANKINGS','0')=='1',
+        results_keyring=Path(results_keyring)if results_keyring else None,
+        results_port=port('RESULTS_PORT',8081),
         bind=str(ipaddress.IPv4Address(env.get("TUBISOFT_BIND_IP", "0.0.0.0"))),
         advertise_ip=address, port=port("ROUTER_PORT", 30000), launcher_port=port("LAUNCHER_PORT", 30001),
         nat_port=port("NAT_PORT", 30002), http_port=port("HTTP_PORT", 8080),
@@ -82,11 +90,15 @@ async def serve(args) -> None:
     args.account_db = args.state / "accounts.sqlite3"
     args.private_key = args.state / "router-private.pem"
     accounts.initialize_database(args.account_db)
+    args.ladder_store=LadderStore(args.account_db)
     ensure_key(args.private_key)
     # Accounts, RSA key and resource limits are process-wide. Each game's GS
     # listeners own its transient handoffs, NAT sessions and room registry.
     products = {}
     tasks = []
+    if getattr(args,'results_keyring',None)is not None:
+        grants=results_api.load_grants(args.results_keyring)
+        tasks.append(asyncio.create_task(results_api.serve(args.ladder_store,grants,port=args.results_port)))
     for binding in args.games:
         profile = binding.profile
         worker_state = getattr(args, 'gr2_worker_state', None) if profile.slug == 'gr2' else None

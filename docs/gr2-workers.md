@@ -62,7 +62,10 @@ with `ready: false`, or with malformed fields. A new 32-character hexadecimal
 the native GameInfo; the worker is not counted as a phantom player.
 
 The 84-byte description is hexadecimal. The service clears password bytes and
-fills known ST01/Assault fields and the advertised IPv4 endpoint. In this build,
+fills the verified map selector, enabled mode and advertised IPv4 endpoint. The
+mode field at `+0x2c`, consumed by native reader `0x3e3010`, accepts Assault=1
+and Team Survival=4. Sabotage/Onslaught remain disabled until their gameplay
+runtimes are implemented. In this build,
 field `0x48` must be zero for dedicated discovery; nonzero selects peer-owner
 membership checks. This is separate from gameplay's `DEDICATED=1` role.
 
@@ -95,7 +98,41 @@ alive. Socket regression tests cover simultaneous members, repeated reports,
 heartbeat continuity and leave/rejoin. Retail continuation into a second round
 still needs verification; this does not resolve native simulation performance.
 
+Late one-way operations 34/70 for this authenticated connection's immediately
+previous room are ignored after explicit leave, worker expiry or replacement.
+They receive no invented ACK, create no membership and cannot displace a newly
+joined room. This handles queued lifecycle reports racing room removal without
+forcing account sign-in again. Unknown room IDs keep the existing rejection
+path. Socket tests cover late reports before and after joining the replacement.
+
 Ranks currently return empty tables using the requested query IDs. Friends,
 complete ranking writes, all GS operations and normal retail game teardown
 remain incomplete. This integration is an experimental beta, with gameplay
 acceptance recorded separately from service tests.
+
+## Map updates on an existing worker
+
+The worker schema accepts canonical `st01_map` through `st10_map`. The original
+UI map table at `0x58bbf0` and settings producer at `0x478170` establish wire
+field `+0x20` as the zero-based map selector (ST01=0, ST10=9). Dedicated travel
+`0x3cf530` updates that selector in the same 84-byte description. The previous
+assumption that this particular write selected a game mode was incorrect.
+
+The relay must preserve the worker's actual map ID. A fresh heartbeat with the
+same `run_id` updates both room info blobs in place; it retains the room ID and
+members. Browser Refresh receives the updated selector. No account/session is
+recreated for a map update. The gameplay worker still needs a validated prepared
+world for each map; accepting a heartbeat is not a claim that all maps are ready.
+The enabled mode slugs are `assault` and `team-survival`; the title shown in the
+browser follows the worker mode. A mode change with the same worker run ID
+updates the title and mode bytes in place without discarding GS membership.
+The adjacent description word `+0x30` is not established as another mode enum.
+Team Survival preserves that template word rather than copying the legacy
+Assault adjustment into it. A fresh validated heartbeat is still required;
+accepting a mode slug does not establish retail gameplay coverage.
+
+Independent beta workers now advertise Assault (1), Onslaught (3) and Team
+Survival (4). The original PS2 selector permits all three on ST01–09 and only
+Team Survival on ST10; incompatible descriptions are rejected. Mode changes
+update the same worker room without discarding GS membership. The unproven
+neighboring description field remains unchanged for non-Assault modes.

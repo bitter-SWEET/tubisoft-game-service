@@ -72,3 +72,10 @@ python tools/extract_gr2.py '/path/to/discs/Ghost Recon 2 (USA).iso'
 For missing platform-auth responses, the [DNAS preservation workbench](docs/dnas-preservation.md) recovers protected GR2 library code and provides private input extraction, replay inventory, transport and comparison tools. It does not yet derive an accepted GR2 response or change the running DNAS service.
 
 Original project code is licensed under **GPLv3**. Referenced MIT code retains its [third-party notice](THIRD_PARTY_NOTICES.md). No game assets, DNAS replays, credentials, or personal deployment configuration are distributed.
+
+## Shared match results
+
+The optional [raw-stat ladder and result ingestion](docs/shared-ladder.md) reuse
+the account SQLite database across titles and modes. Gameplay workers submit
+authenticated, idempotent round reports; open guest play remains unranked. This
+feature is disabled by default and has not been deployed by this change.

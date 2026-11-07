@@ -67,3 +67,11 @@ For a shared VPS, first inspect current listeners, container names, memory/disk 
 ## Publication boundary
 
 Only source, synthetic tests, deployment templates, tooling, and sanitized research notes belong in Git. `work`, account databases/backups, `.env`, keys/certificates, captures/logs, disc/overlay contents, memory cards, and generated disassembly/decompilation stay private. `.dockerignore` also prevents those files entering the build context. Run `python tools/publication_audit.py --git` in the clean publication checkout before each push. Review the staged file list and the commit's author identity too.
+
+## Optional match results
+
+See [shared-ladder.md](shared-ladder.md) before enabling private worker ingestion
+or experimental populated ranking replies. The result tables share the account
+database and its backup; no new public port or tester restriction is needed.
+The current Compose file leaves ingestion disabled, and current open GR2 worker
+principals remain guests until a verified account handoff is implemented.

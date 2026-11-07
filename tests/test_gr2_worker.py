@@ -56,6 +56,75 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(struct.unpack_from('<I', encoded, 72)[0], 0)
         self.assertEqual(struct.unpack_from('<I', encoded, 44)[0], 1)
 
+    def test_all_original_map_selectors_encode_without_changing_mode_or_endpoint(self):
+        for index in range(10):
+            mode='assault'if index<9 else'team-survival'
+            payload=game_description('192.0.2.1',3659,bytes(84),map_id=f'st{index+1:02}_map',mode=mode)
+            self.assertEqual(struct.unpack_from('<I',payload,0x20)[0],index)
+            self.assertEqual(struct.unpack_from('<I',payload,0x2c)[0],1 if index<9 else 4)
+            self.assertEqual(payload[0x4c:0x50],b'\xc0\x00\x02\x01')
+            self.assertEqual(payload[0x10:0x20],bytes(16))
+        for invalid in ('st00_map','st11_map','ST01_MAP','st1_map','other',None,[],True):
+            with self.assertRaises(ValueError):game_description('192.0.2.1',3659,bytes(84),map_id=invalid)
+
+    def test_map_change_refreshes_description_in_place_without_dropping_members(self):
+        with TemporaryDirectory() as directory:
+            path=Path(directory)/'worker.json';path.write_text(json.dumps(record()))
+            registry=RoomRegistry();registry.worker_provider=lambda:read_worker(path,PROFILE,100)
+            first=registry.children(GR2.product)[0];room=registry.active_room(int(first[2]),GR2.product)
+            member=('192.0.2.2','synthetic-member');room.members.add(member)
+            removed=[];registry.add_remove_listener(lambda room:removed.append(room.room_id))
+            for index in range(10):
+                path.write_text(json.dumps(record()|{'map':f'st{index+1:02}_map','mode':'assault'if index<9 else'team-survival'}))
+                refreshed=registry.children(GR2.product)[0]
+                self.assertEqual(refreshed[2],first[2]);self.assertIn(member,room.members)
+                self.assertEqual(struct.unpack_from('<I',room.info,0x20)[0],index)
+                self.assertEqual(room.info,room.additional_info)
+            self.assertEqual(removed,[])
+
+    def test_survival_advertisement_uses_real_mode_and_preserves_unproved_neighbor(self):
+        template=bytearray(84);struct.pack_into('<I',template,0x30,7)
+        encoded=game_description('192.0.2.1',3659,bytes(template),mode='team-survival')
+        self.assertEqual(struct.unpack_from('<I',encoded,0x2c)[0],4)
+        self.assertEqual(struct.unpack_from('<I',encoded,0x30)[0],7)
+        for unsupported in ('sabotage','no-rules',4,None,[],True):
+            with self.assertRaises(ValueError):game_description('192.0.2.1',3659,bytes(template),mode=unsupported)
+
+    def test_onslaught_and_survival_only_sandbox_follow_original_selectors(self):
+        template=bytearray(84);struct.pack_into('<I',template,0x30,7)
+        encoded=game_description('192.0.2.1',3659,bytes(template),mode='onslaught')
+        self.assertEqual(struct.unpack_from('<I',encoded,0x2c)[0],3)
+        self.assertEqual(struct.unpack_from('<I',encoded,0x30)[0],7)
+        for unsupported in ('assault','onslaught'):
+            with self.assertRaises(ValueError):
+                game_description('192.0.2.1',3659,bytes(template),map_id='st10_map',mode=unsupported)
+        with TemporaryDirectory()as folder:
+            p=Path(folder)/'worker.json'
+            for mode in ('assault','onslaught'):
+                p.write_text(json.dumps(record()|dict(map='st10_map',mode=mode)))
+                self.assertIsNone(read_worker(p,PROFILE,100))
+            p.write_text(json.dumps(record()|dict(map='st10_map',mode='team-survival')))
+            self.assertIsNotNone(read_worker(p,PROFILE,100))
+
+    def test_mode_change_updates_name_and_enum_without_dropping_directory_members(self):
+        with TemporaryDirectory()as directory:
+            path=Path(directory)/'worker.json';path.write_text(json.dumps(record()))
+            registry=RoomRegistry();registry.worker_provider=lambda:read_worker(path,PROFILE,100)
+            first=registry.children(GR2.product)[0];room=registry.active_room(int(first[2]),GR2.product)
+            member=('192.0.2.2','synthetic-member');room.members.add(member)
+            path.write_text(json.dumps(record()|{'mode':'team-survival'}))
+            updated=registry.children(GR2.product)[0]
+            self.assertEqual(updated[2],first[2]);self.assertIn(member,room.members)
+            self.assertEqual(updated[1],'Tubisoft GR2 Team Survival')
+            self.assertEqual(struct.unpack_from('<I',room.info,0x2c)[0],4)
+            path.write_text(json.dumps(record()|{'mode':'onslaught'}))
+            updated=registry.children(GR2.product)[0]
+            self.assertEqual(updated[2],first[2]);self.assertIn(member,room.members)
+            self.assertEqual(room.name,'Tubisoft GR2 Onslaught')
+            self.assertEqual(struct.unpack_from('<I',room.info,0x2c)[0],3)
+            path.write_text(json.dumps(record()|{'mode':'sabotage'}))
+            self.assertEqual(registry.children(GR2.product),[])
+
     def test_stale_stopped_invalid_and_default_disabled_workers_are_absent(self):
         with TemporaryDirectory() as directory:
             path = Path(directory)/'worker.json'
@@ -157,6 +226,9 @@ class WorkerSocketTests(unittest.IsolatedAsyncioTestCase):
                     await client.send(0xd1,['8',[roomid]])
                     _,fields=await client.receive();self.assertEqual(fields,['38',['8',[roomid]]])
                     self.assertEqual(len(room.members),1)
+                    for subtype in ('34','70'):await client.send(0xd1,[subtype,[roomid]])
+                    await client.send(0x3a)
+                    header,_=await client.receive();self.assertEqual(header.message_type,0x3a)
                     await client.send(0xd1,['24',[roomid,'','0','0',GR2.product]])
                     await client.receive();await client.receive()
                     self.assertEqual(len(room.members),2)
@@ -164,7 +236,29 @@ class WorkerSocketTests(unittest.IsolatedAsyncioTestCase):
                     other.writer.close();await other.writer.wait_closed()
                 state.unlink();registry.sync_worker()
                 _,fields=await client.receive();self.assertEqual(fields,['55',[roomid]])
+                # A worker expiry/restart can race the client's last one-way
+                # game/round report. It must not force a new account sign-in.
+                for subtype in ('34','70'):await client.send(0xd1,[subtype,[roomid]])
                 await client.send(0x3a)
+                header,_=await client.receive();self.assertEqual(header.message_type,0x3a)
+                state.write_text(json.dumps(record(time.time())|{'run_id':'b'*32}))
+                new_id=registry.children(GR2.product)[0][2]
+                self.assertNotEqual(new_id,roomid)
+                await client.send(0xd1,['24',[new_id,'','0','0',GR2.product]])
+                _,fields=await client.receive();self.assertEqual(fields,['38',['24',[new_id,'']]])
+                await client.receive()
+                # A delayed old report also cannot invalidate a newly joined
+                # room on this same authenticated GS connection.
+                for subtype in ('34','70'):await client.send(0xd1,[subtype,[roomid]])
+                await client.send(0x3a)
+                header,_=await client.receive();self.assertEqual(header.message_type,0x3a)
+                self.assertEqual(len(registry.active_room(int(new_id),GR2.product).members),1)
+                # No background watcher here: this incoming report discovers
+                # expiry itself and invokes removal during active_room().
+                state.unlink()
+                await client.send(0xd1,['34',[new_id]])
+                await client.send(0x3a)
+                _,fields=await client.receive();self.assertEqual(fields,['55',[new_id]])
                 header,_=await client.receive();self.assertEqual(header.message_type,0x3a)
             finally:
                 client.writer.close();await client.writer.wait_closed()

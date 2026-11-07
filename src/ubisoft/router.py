@@ -54,7 +54,8 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                  host_probe: srp_probe.Probe | None = None,
                  access_policy: AccessPolicy | None = None,
                  game_profile: GameProfile = XIII,
-                 proxy_handoffs: proxy.Handoffs | None = None) -> None:
+                 proxy_handoffs: proxy.Handoffs | None = None,
+                 ranking_store=None) -> None:
     peer = writer.get_extra_info("peername")
     local = writer.get_extra_info("sockname")
     LOG.info("connected game=%s peer=%s local=%s", game_profile.slug, peer, local)
@@ -305,10 +306,10 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                      fields[0][0] if isinstance(fields[0], list) else fields[0])
                             continue
                         if proxy_route and header.message_type == 0xcc and proxy_ready:
-                            reply = proxy.query_reply(game_profile, fields, proxy_user)
+                            reply = proxy.query_reply(game_profile, fields, proxy_user, ranking_store=ranking_store)
                             writer.write(make_frame(header, reply))
                             await writer.drain()
-                            LOG.info("empty ranking result game=%s peer=%s operation=%s request=%s",
+                            LOG.info("ranking result game=%s peer=%s operation=%s request=%s",
                                      game_profile.slug, peer, fields[0], fields[1])
                             continue
                         if (header.message_type == 0xd9 and local[1] != wait_port
@@ -532,10 +533,29 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                 await writer.drain()
                                 LOG.info("additional room info sent peer=%s room=%d", peer, room.room_id)
                                 continue
+                            if (subtype in (34, 70) and game_profile.slug == 'gr2'
+                                    and lobby_logged_in and closed_room_id is not None
+                                    and (joined_room is None or joined_room.room_id != closed_room_id)
+                                    and fields[1] == [str(closed_room_id)]):
+                                # Worker removal may race a previously queued
+                                # one-way game-connected/round report. It grants
+                                # no membership or identity and has no ACK. Keep
+                                # the signed-in browser/new room usable.
+                                LOG.info('late game report ignored game=%s peer=%s subtype=%d room=%d; sign-in retained',
+                                         game_profile.slug, peer, subtype, closed_room_id)
+                                continue
                             if subtype == 34 and joined_room is not None:
-                                if registry.active_room(joined_room.room_id, game_profile.product) is not joined_room:
+                                connected_room = joined_room
+                                if registry.active_room(connected_room.room_id, game_profile.product) is not connected_room:
+                                    # active_room can discover expiry and invoke
+                                    # room_removed synchronously in this call.
+                                    if (game_profile.slug == 'gr2' and lobby_logged_in
+                                            and fields[1] == [str(connected_room.room_id)]
+                                            and closed_room_id == connected_room.room_id):
+                                        LOG.info('game-connected report raced worker expiry peer=%s; sign-in retained', peer)
+                                        continue
                                     raise ValueError('game-connected worker unavailable')
-                                game_profile.game_connected(joined_room, fields[1])
+                                game_profile.game_connected(connected_room, fields[1])
                                 LOG.info('game connection reported game=%s peer=%s room=%d; GS session retained',
                                          game_profile.slug, peer, joined_room.room_id)
                                 continue
@@ -600,6 +620,8 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                 writer.write(response_header(header, payload, 0xd1) + payload)
                                 await writer.drain()
                                 LOG.info("room leave accepted peer=%s group=%s; sign-in session retained", peer, group_id)
+                                if joined_room is not None:
+                                    closed_room_id = joined_room.room_id
                                 joined_room = None
                                 if host_room is not None:
                                     removed = registry.unbind_host(host_room, host_connection)
@@ -657,7 +679,7 @@ async def serve(args: argparse.Namespace) -> None:
         try:
             await handle(reader, writer, key, args.timeout, args.account_db, advertise_ip, args.port,
                          pending_handoffs, authenticated, registry, host_probe, access_policy, game_profile,
-                         proxy_handoffs)
+                         proxy_handoffs,ranking_store=getattr(args,'ladder_store',None)if getattr(args,'native_rankings',False)else None)
         finally:
             if access_policy is not None:
                 access_policy.release(peer_ip)

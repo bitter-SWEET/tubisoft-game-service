@@ -16,6 +16,7 @@ dedicated gameplay server or match-joining flow.
 | Room lifecycle | `rooms.py`: pending/active state, membership, owner connection tracking, removal listeners | Registration metadata, advertisement flags; opaque game and score blobs |
 | Reliable UDP | `srp_probe.py`: checksum/padding, sequence ring, ACKs, retries, host sessions | Host operation validation, member notifications and update interpretation |
 | NAT | `nat.py`: correlated token/probe state, observed endpoints, bounded retries | Verify the title's request/callback dialect; no gameplay relay is implied |
+| Match results | `ladder.py`, `results_api.py`: shared SQLite raw totals and private worker ingestion | Verified account principals, per-mode counters and native ranking table adapters |
 | Runtime | `service.py`, `access.py`: startup, shared state path, global resource limits, private logs | `games/registry.py`: enabled profiles and per-title listener bindings |
 
 `games/base.py` defines `GameProfile` and normalized `RoomSpec`. The implemented
@@ -28,7 +29,9 @@ Discovery and game-room hosting are separate capabilities. Profile hooks for
 and directory path while `supports_rooms` remains false. Ranking transport
 request IDs and the application IDs inside result tables are separate values;
 both must survive the shared/profile boundary. Empty ranking records currently
-use GR2's native unranked-player path; they do not provide persistent rankings.
+use GR2's native unranked-player path; the default remains empty. The optional [shared ladder](shared-ladder.md) now
+stores authenticated worker reports and provides an experimental named-alias
+query adapter. Live GR2 guest identities cannot earn account credit yet.
 GR2 PS2 originally used dedicated gameplay servers; shared GS support and
 retained Create handlers do not establish a player-hosting flow. Its missing
 gameplay runtime must remain separate from the shared accounts/directory core.
@@ -62,9 +65,9 @@ handoff model still correlates by `(IP, account)` and is not a complete original
 GS session-token implementation.
 
 Rooms and handoffs intentionally remain in memory: a restart must not advertise
-an old match whose host is gone. Future rankings or per-title preferences should
-use separate tables keyed by `(account identity, product)`, without duplicating
-credentials or putting game columns into password verification.
+an old match whose host is gone. Match rankings now use separate account-referenced result tables with product
+and mode scopes. Per-title preferences should likewise stay separate from
+credentials and password verification.
 
 ## Enabling games
 
