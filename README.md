@@ -8,7 +8,7 @@ The common `ubisoft` package provides GS framing, crypto, shared SQLite accounts
 
 XIII remains enabled by default. Ghost Recon 2 is an opt-in experimental profile with shared accounts, native bootstrap, login, lobby discovery and empty ranking-table startup. A separate owned-disc gameplay worker can advertise a dedicated Assault room. An unmodified retail client has discovered that room, joined and reached player setup/Ready; movement, combat and round transitions still need multi-player testing. Persistent GR2 rankings are not implemented.
 
-The gameplay engine, PCSX2 launcher, asset adapters and runtime research now live in the separate **gr2-dedicated-server** project folder, prepared for its own repository. Tubisoft contains only shared services and the validated worker-directory interface. See [GR2 workers](docs/gr2-workers.md) and [GR2 protocol research](docs/ghost-recon-2-network.md).
+The independent Python gameplay worker, private data preparation tools and historical emulator research live in [gr2-ps2-dedicated-server](https://github.com/princebyyourlogic/gr2-ps2-dedicated-server). Tubisoft contains only shared services and the validated worker-directory interface. See [GR2 workers](docs/gr2-workers.md) and [GR2 protocol research](docs/ghost-recon-2-network.md).
 
 ## Run a beta instance
 

@@ -1,14 +1,16 @@
 # Ghost Recon 2 worker integration
 
 Tubisoft handles accounts and Ubisoft GS. The separate **gr2-dedicated-server**
-project handles the original PS2 gameplay engine, PCSX2 and private owned-disc
-assets. No ISO, BIOS, generated ELF, asset cache or memory card is needed by
+project provides the independent Python gameplay worker and private owned-disc
+preparation tools. Its historical PCSX2/native research tools are separate from
+the beta runtime. No ISO, BIOS, generated ELF, asset cache or memory card is needed by
 this service, and none belongs in its repository or Docker image.
 
-An unmodified retail USA client has signed in, found the dedicated Assault
-room, joined and reached player setup/Ready. Multi-player movement, combat,
-results and repeated rounds remain acceptance tests. The retained team modes
-require further start-rule validation; online bots have not been established.
+Unmodified retail USA clients have played Assault on the independent worker.
+The beta adds offline coverage for 28 map/mode combinations, objectives, combat,
+results and repeated rounds. New maps, alternate modes and cross-map travel
+still need retail acceptance; online bots have not been established. The
+companion repository records gameplay evidence and remaining limitations.
 
 ## Enable GR2 and a worker
 
@@ -53,19 +55,20 @@ The producer atomically replaces a UTF-8 JSON document, at most 4096 bytes:
 }
 ```
 
-The producer must set `ready` only after validating the native map, server-only
-role, bound driver socket, advancing world tick and native player counts.
+The producer must set `ready` only after validating its prepared map, server
+role, bound gameplay socket, advancing world tick and actual player counts.
+The historical native adapter additionally validates original engine state.
 `updated` is Unix wall-clock seconds; replace the example with current time.
 The service checks every second and removes a record older than five seconds,
 with `ready: false`, or with malformed fields. A new 32-character hexadecimal
 `run_id` replaces the previous room and notifies its members. Counts come from
-the native GameInfo; the worker is not counted as a phantom player.
+the authoritative gameplay sessions; the worker is not a phantom player.
 
 The 84-byte description is hexadecimal. The service clears password bytes and
 fills the verified map selector, enabled mode and advertised IPv4 endpoint. The
 mode field at `+0x2c`, consumed by native reader `0x3e3010`, accepts Assault=1
-and Team Survival=4. Sabotage/Onslaught remain disabled until their gameplay
-runtimes are implemented. In this build,
+Onslaught=3 and Team Survival=4. Sabotage is disabled by the original map/mode
+selector on every map. In this build,
 field `0x48` must be zero for dedicated discovery; nonzero selects peer-owner
 membership checks. This is separate from gameplay's `DEDICATED=1` role.
 
@@ -123,11 +126,11 @@ same `run_id` updates both room info blobs in place; it retains the room ID and
 members. Browser Refresh receives the updated selector. No account/session is
 recreated for a map update. The gameplay worker still needs a validated prepared
 world for each map; accepting a heartbeat is not a claim that all maps are ready.
-The enabled mode slugs are `assault` and `team-survival`; the title shown in the
+The enabled mode slugs are `assault`, `onslaught` and `team-survival`; the title shown in the
 browser follows the worker mode. A mode change with the same worker run ID
 updates the title and mode bytes in place without discarding GS membership.
 The adjacent description word `+0x30` is not established as another mode enum.
-Team Survival preserves that template word rather than copying the legacy
+Non-Assault modes preserve that template word rather than copying the legacy
 Assault adjustment into it. A fresh validated heartbeat is still required;
 accepting a mode slug does not establish retail gameplay coverage.
 
