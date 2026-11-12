@@ -427,6 +427,7 @@ class R6ParentMemberTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(fields, ["38", ["23", ["1", ""]]])
                     _, fields = await lobby.receive()
                     self.assertEqual(fields[0], "53")
+                    lobby.wait = wait
                     return lobby, fields[1][3]
 
                 host_info, guest_info = bytes(range(24)), bytes(range(24, 48))
@@ -459,6 +460,16 @@ class R6ParentMemberTests(unittest.IsolatedAsyncioTestCase):
                 _, fields = await host.receive()
                 self.assertEqual(fields, ["50", ["GuestFixture", "0", "1", "127.0.0.1", "127.0.0.1",
                                                  guest_info, "0"]])
+                # The lobby player list asks for other members' player info;
+                # an empty or unknown name is a GS failure, not a disconnect.
+                await host.wait.send(0x13, ["guestfixture"])
+                header, fields = await host.wait.receive()
+                self.assertEqual((header.message_type, fields),
+                                 (0x26, [b"\x13", ["GuestFixture", "GuestFixture", "", "", "", "", ""]]))
+                for name in ("", "NobodyFixture"):
+                    await host.wait.send(0x13, [name])
+                    header, fields = await host.wait.receive()
+                    self.assertEqual((header.message_type, fields), (0x27, [b"\x13", [bytes(4)]]))
                 # Joining files the guest under the room (counted by the
                 # others) and gives the guest the room's members.
                 await guest.send(0xd1, ["24", [room_id, "", "0", "0", "1.0"]])

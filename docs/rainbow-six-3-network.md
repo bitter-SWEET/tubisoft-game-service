@@ -307,6 +307,16 @@ server takes no part in that. Drawing names is UnrealScript HUD logic
 (`SetIdentifyTarget`, the server option `ShowNames`), so it is most likely a
 game-mode or option effect rather than a lobby-protocol gap.
 
+In the tenth run, both players returned to the lobby after the round ended
+and opened its player list. The client then sent `0x13 [""]` (player info,
+native `0x00406ec0` -> sender `0x00410610`) on the wait-module connection.
+The router only answered requests for the caller's own name, so it dropped
+the connection and the game signed out. The reply reader `0x0040fed0`
+(via `0x004110a0`) accepts `0x26` with the profile strings or `0x27` with a
+four-byte error code. R6 now answers with the profile for any signed-in
+parent member and with `0x27 [0x13, [0x00000000]]` for an empty or unknown
+name. XIII's behaviour is unchanged.
+
 ## Launcher hosting path (XIII-like)
 
 The launcher client (global GP−`0x46f0`) logs in with three strings

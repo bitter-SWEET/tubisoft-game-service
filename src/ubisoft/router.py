@@ -464,6 +464,27 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                             await writer.drain()
                             LOG.info("player info sent peer=%s", peer)
                             continue
+                        elif (header.message_type == 0x13 and wait_user is not None
+                              and game_profile.lobby_members and len(fields) == 1
+                              and isinstance(fields[0], str)):
+                            # Lobby player list (native 0x00406ec0 -> sender
+                            # 0x00410610). The reply reader (0x0040fed0, via
+                            # 0x004110a0) accepts 0x26 with the profile strings
+                            # or 0x27 with a four-byte error code.
+                            known = [member.name for member in registry.lobby_members(game_profile.product)
+                                     if fields[0] and member.name.casefold() == fields[0].casefold()]
+                            if known:
+                                profile = [known[0], known[0], "", "", "", "", ""]
+                                payload = gsxor.encrypt(data.encode([b"\x13", profile]))
+                                writer.write(response_header(header, payload, 0x26) + payload)
+                                LOG.info("member player info sent game=%s peer=%s", game_profile.slug, peer)
+                            else:
+                                payload = gsxor.encrypt(data.encode([b"\x13", [bytes(4)]]))
+                                writer.write(response_header(header, payload, 0x27) + payload)
+                                LOG.info("player info unavailable game=%s peer=%s name_bytes=%d",
+                                         game_profile.slug, peer, len(fields[0].encode()))
+                            await writer.drain()
+                            continue
                         elif (header.message_type == 0x4e and wait_user is not None
                               and len(fields) == 2
                               and all(isinstance(field, bytes) and len(field) == 4 for field in fields)):
