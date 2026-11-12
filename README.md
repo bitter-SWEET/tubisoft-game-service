@@ -8,6 +8,8 @@ The common `ubisoft` package provides GS framing, crypto, shared SQLite accounts
 
 XIII remains enabled by default. Ghost Recon 2 is an opt-in experimental profile with shared accounts, native bootstrap, login, lobby discovery and empty ranking-table startup. A separate owned-disc gameplay worker can advertise a dedicated Assault room. An unmodified retail client has discovered that room, joined and reached player setup/Ready; movement, combat and round transitions still need multi-player testing. Persistent GR2 rankings are not implemented.
 
+Rainbow Six 3 (`r6`, `RAINBOWSIX3PS2US`) is a second opt-in experimental profile. A retail client has signed in, passed ranking startup and entered the Rainbow Six 3 lobby; lobby-server game creation is experimental and joining another player's game is not implemented yet. See [Rainbow Six 3 notes](docs/rainbow-six-3-network.md) and `deploy/compose.r6.yaml`.
+
 The independent Python gameplay worker, private data preparation tools and historical emulator research live in [gr2-ps2-dedicated-server](https://github.com/princebyyourlogic/gr2-ps2-dedicated-server). Tubisoft contains only shared services and the validated worker-directory interface. See [GR2 workers](docs/gr2-workers.md) and [GR2 protocol research](docs/ghost-recon-2-network.md).
 
 ## Run a beta instance

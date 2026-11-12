@@ -4,9 +4,10 @@ from types import MappingProxyType
 
 from .base import GameProfile
 from .gr2 import PROFILE as GR2
+from .r6 import PROFILE as R6
 from .xiii import PROFILE as XIII
 
-PROFILES = MappingProxyType({profile.slug: profile for profile in (XIII, GR2)})
+PROFILES = MappingProxyType({profile.slug: profile for profile in (XIII, GR2, R6)})
 
 
 @dataclass(frozen=True)
