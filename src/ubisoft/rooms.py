@@ -30,9 +30,6 @@ class Room:
     sdk_version: str
     local_ip: str = ""
     profile: GameProfile = field(default=XIII, repr=False)
-    # The owner's sign-in name exactly as the game sent it; `owner` is the
-    # case-folded identity used for authorization.
-    owner_name: str = ""
     active: bool = False
     pending_until: float = 0
     members: set[tuple[str, str]] = field(default_factory=set)
@@ -51,28 +48,14 @@ class Room:
         host = (self.peer_ip, self.owner)
         player_count = self.worker_players if self.dedicated else 1 + len(self.members - {host})
         return [self.group_type, self.name, str(self.room_id), "1", self.parent_id,
-                advertised_flags, "2", self.owner_name or self.owner, "", self.product, self.info, "0",
+                advertised_flags, "2", self.owner, "", self.product, self.info, "0",
                 self.max_players, str(player_count), self.max_spectators, "0",
                 self.game_version, self.sdk_version, self.peer_ip, self.local_ip or self.peer_ip]
-
-
-@dataclass
-class LobbyMember:
-    """A signed-in parent-lobby member, as announced to the other members."""
-    name: str
-    product: str
-    address: str
-    local_address: str
-    send: Callable[[list], None] = field(repr=False)
-    info: bytes = b""
-    group: str = "1"
-    announced: bool = False
 
 
 class RoomRegistry:
     def __init__(self) -> None:
         self._rooms: dict[int, Room] = {}
-        self._lobby: dict[object, LobbyMember] = {}
         self._next_id = 1000
         self._remove_listeners: set[Callable[[Room], None]] = set()
         self.worker_provider = None
@@ -118,17 +101,26 @@ class RoomRegistry:
         self._remove_listeners.discard(listener)
 
     def register(self, owner: str, peer_ip: str, fields: list, profile: GameProfile = XIII) -> Room:
-        self.expire_pending()
+        now = time.monotonic()
+        self.expire_pending(now)
         profile.require_rooms()
         spec = profile.registration(fields, peer_ip)
         if spec.product != profile.product:
             raise ValueError("registration product does not match listener")
-        if any(room.owner == owner and room.peer_ip == peer_ip and room.product == profile.product
-               for room in self._rooms.values()):
-            raise ValueError("owner already has a registered room for this game")
-        room_id = -self._next_id if profile.negative_room_ids else self._next_id
-        room = Room(room_id, owner, peer_ip, **asdict(spec), profile=profile,
-                    pending_until=time.monotonic() + PENDING_ROOM_SECONDS)
+        settings = asdict(spec)
+        pending_until = now + PENDING_ROOM_SECONDS
+        existing = next((room for room in self._rooms.values()
+                         if (room.owner, room.peer_ip, room.product) == (owner, peer_ip, profile.product)), None)
+        if existing is not None:
+            if existing.active:
+                raise ValueError("owner already has a registered room for this game")
+            # A repeated launcher request can race the host's UDP login.
+            # Keep its room ID unless the host changed the registration settings.
+            if all(getattr(existing, key) == value for key, value in settings.items()):
+                existing.pending_until = pending_until
+                return existing
+            del self._rooms[existing.room_id]
+        room = Room(self._next_id, owner, peer_ip, **settings, profile=profile, pending_until=pending_until)
         self._next_id += 1
         self._rooms[room.room_id] = room
         return room
@@ -178,19 +170,6 @@ class RoomRegistry:
         self.sync_worker()
         room = self._rooms.get(room_id)
         return room if room is not None and room.active and (product is None or room.product == product) else None
-
-    def lobby_join(self, connection: object, member: LobbyMember) -> LobbyMember:
-        return self._lobby.setdefault(connection, member)
-
-    def lobby_member(self, connection: object) -> LobbyMember | None:
-        return self._lobby.get(connection)
-
-    def lobby_leave(self, connection: object) -> LobbyMember | None:
-        return self._lobby.pop(connection, None)
-
-    def lobby_members(self, product: str, exclude: object = None) -> list[LobbyMember]:
-        return [member for connection, member in self._lobby.items()
-                if connection is not exclude and member.product == product]
 
     def children(self, product: str = XIII.product) -> list:
         self.sync_worker()
