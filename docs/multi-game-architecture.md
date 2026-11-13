@@ -77,7 +77,7 @@ Production defaults are unchanged:
 | --- | --- | --- | --- | --- | --- |
 | `xiii` | `XIIIPS2US` | 30000 | 30001 | 30002 | Existing open beta; client gameplay exercised |
 | `gr2` | `GHOSTRECON2PS2` | 30010 | 30011 | 30012 | Experimental; shared login/lobby and worker join to Ready verified; full gameplay pending |
-| `r6` | `RAINBOWSIX3PS2US` | 30020 | 30021 | 30022 | Experimental; sign-in, discovery and ranking startup mapped statically; no retail run yet |
+| `r6` | `RAINBOWSIX3PS2US` | 30020 | 30021 | 30022 | Experimental; two retail clients (PCSX2) hosted, joined and played rated matches; more than two players and dedicated-server stages untested |
 
 For a local Python development instance, set `TUBISOFT_GAMES=xiii,gr2` plus the
 usual advertised address and state directory. XIII retains the existing

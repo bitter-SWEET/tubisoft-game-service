@@ -671,6 +671,11 @@ Recording:
 
 - Every operation 30 keeps the match's latest results. The owner's
   operation 45, at round end, records them.
+- Only the room's owner sends operation 30 in the retail runs, and the
+  service accepts it only from the owner and only for the match ID that the
+  room's latest operation 17 started. Another player's report is ignored
+  without a reply. The owner's report for a finished or replaced match is
+  acknowledged but neither stored nor broadcast.
 - A round that is abandoned (a new operation 17 with no operation 45) is
   not recorded.
 - Each player with an account gets a row on the mode's ladder and on

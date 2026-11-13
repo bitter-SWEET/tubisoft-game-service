@@ -981,13 +981,31 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                 # (set by 0x00457280). Reader 0x0041e8c0 only
                                 # reads the first value back. The room's
                                 # members get the values as operation 71.
-                                # Results are not stored yet; the log records
-                                # the values (names only by length).
-                                current = host_room or joined_room
+                                # The log records the values (names only by
+                                # length).
+                                active = registry.room_matches.get(host_room.room_id) if host_room is not None else None
+                                if host_room is None:
+                                    # Only the room's owner reports results (every
+                                    # retail run); anyone else is not answered.
+                                    LOG.info("match results ignored game=%s peer=%s reason=not-room-owner",
+                                             game_profile.slug, peer)
+                                    continue
+                                if fields[1][0] != active:
+                                    # A report for a match that this room's
+                                    # operation 17 did not start, or one already
+                                    # finished or replaced, is acknowledged to
+                                    # the owner but neither kept nor broadcast.
+                                    payload = gsxor.encrypt(data.encode(["38", ["30", [fields[1][0]]]]))
+                                    writer.write(response_header(header, payload, 0xd1) + payload)
+                                    await writer.drain()
+                                    LOG.info("match results ignored game=%s peer=%s room=%d reason=not-active-match",
+                                             game_profile.slug, peer, host_room.room_id)
+                                    continue
+                                current = host_room
                                 mode = registry.match_modes.get(fields[1][0])
                                 ladder = game_profile.match_ladder(account_db)
                                 changes = {}
-                                if ladder is not None and current is not None:
+                                if ladder is not None:
                                     # Rating changes so far; the ladder is
                                     # updated when the round ends (operation 45).
                                     changes = await asyncio.to_thread(ladder.provisional, fields[1][2:], mode)
@@ -997,16 +1015,13 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                 event = game_profile.match_results_event(fields[1][0], fields[1][2:], mode, changes)
                                 payload = gsxor.encrypt(data.encode(["38", ["30", [fields[1][0]]]]))
                                 writer.write(response_header(header, payload, 0xd1) + payload)
-                                in_room = []
-                                if current is not None:
-                                    in_room = [member for member in registry.lobby_members(game_profile.product)
-                                               if member.group == str(current.room_id)]
-                                    for member in in_room:
-                                        member.send(event)
+                                in_room = [member for member in registry.lobby_members(game_profile.product)
+                                           if member.group == str(current.room_id)]
+                                for member in in_room:
+                                    member.send(event)
                                 await writer.drain()
-                                LOG.info("match results received game=%s peer=%s match=%s room=%s recipients=%d shape=%s",
-                                         game_profile.slug, peer, fields[1][0],
-                                         current.room_id if current is not None else None,
+                                LOG.info("match results received game=%s peer=%s match=%s room=%d recipients=%d shape=%s",
+                                         game_profile.slug, peer, fields[1][0], current.room_id,
                                          len(in_room), value_shape(fields[1][1:], limit=64))
                                 continue
                             if (game_profile.lobby_create and host_room is not None

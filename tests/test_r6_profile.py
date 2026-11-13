@@ -675,6 +675,19 @@ class R6ParentMemberTests(unittest.IsolatedAsyncioTestCase):
                     # TEAMRATIO, TIMEPLAYED (state 2 is Team Survival).
                     self.assertEqual(fields, ["71", [match_id, "38", [["HostFixture", [
                         "0", "0", "1", "1", "2", "0", "0", "0", "1", "0", "0", "272"]]]]])
+                # Only the owner reports results, and only for the room's
+                # active match: a guest's report gets no reply and is not
+                # broadcast; the owner's report for another match ID is
+                # acknowledged but neither kept nor broadcast.
+                forged = ["GuestFixture", "19", "20", "1048575", ["6", "99"] + ["0"] * 18]
+                await guest.send(0xd1, ["30", [match_id, "0", forged]])
+                await guest.send(0x3a)
+                header, _ = await guest.receive()
+                self.assertEqual(header.message_type, 0x3a)
+                stale = str(int(match_id) + 100)
+                await host.send(0xd1, ["30", [stale, "0", forged]])
+                _, fields = await host.receive()
+                self.assertEqual(fields, ["38", ["30", [stale]]])
                 # The owner's end-of-round report (45) has a completion.
                 await host.send(0xd1, ["45", [room_id]])
                 _, fields = await host.receive()
