@@ -681,6 +681,14 @@ Recording:
   is rejected before anything is rated, stored or broadcast, and the
   connection is closed. The bounds are 255 for the team, 9,999 for each kill,
   death and team-kill count, and 86,400 seconds (`r6_ladder.FIELD_LIMITS`).
+- Only players who were in the room at some point since the match's
+  operation 17 can be rated. An entry naming anyone else is dropped from the
+  stored results and the operation 71 broadcast. A player who leaves
+  mid-round stays eligible. A report that names a player twice is rejected.
+- The statistics themselves are only as trustworthy as the room owner. The
+  game runs the match on the owner's console, and only that console reports
+  the results, so the service cannot verify them. These checks limit a
+  dishonest owner to misreporting the players who were really in the room.
 - A round that is abandoned (a new operation 17 with no operation 45, or
   the room removed first) is not recorded. Its match ID, mode and latest
   results are dropped with it, so abandoned rounds leave no state behind

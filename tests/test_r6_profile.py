@@ -665,7 +665,10 @@ class R6ParentMemberTests(unittest.IsolatedAsyncioTestCase):
                 # 71, in ladder-column order.
                 values = ["6", "1"] + ["0"] * 15 + ["2", "0", "272"]
                 entry = ["HostFixture", "19", "20", "1048575", values]
-                await host.send(0xd1, ["30", [match_id, "0", entry]])
+                # An entry for an account that is not in the room is dropped:
+                # it is neither rated nor broadcast.
+                outsider = ["OutsiderFixture", "19", "20", "1048575", ["7", "9"] + ["0"] * 18]
+                await host.send(0xd1, ["30", [match_id, "0", entry, outsider]])
                 _, fields = await host.receive()
                 self.assertEqual(fields, ["38", ["30", [match_id]]])
                 for member in (host, guest):

@@ -1005,25 +1005,38 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                 current = host_room
                                 mode = registry.match_modes.get(fields[1][0])
                                 ladder = game_profile.match_ladder(account_db)
+                                in_room = [member for member in registry.lobby_members(game_profile.product)
+                                           if member.group == str(current.room_id)]
+                                # Only players who have been in this room since
+                                # the match started are kept: an entry naming
+                                # anyone else is dropped, so an owner cannot
+                                # rate accounts that did not play. A player who
+                                # leaves mid-round stays eligible. Duplicate
+                                # names are rejected by summarize().
+                                players = registry.match_players.setdefault(fields[1][0], set())
+                                players.update(member.name.casefold() for member in in_room)
+                                entries = [entry for entry in fields[1][2:]
+                                           if not (isinstance(entry, list) and entry and isinstance(entry[0], str))
+                                           or entry[0].casefold() in players]
+                                dropped = len(fields[1][2:]) - len(entries)
                                 changes = {}
                                 if ladder is not None:
                                     # Rating changes so far; the ladder is
                                     # updated when the round ends (operation 45).
-                                    changes = await asyncio.to_thread(ladder.provisional, fields[1][2:], mode)
-                                    registry.match_results[fields[1][0]] = (current.room_id, fields[1][2:])
+                                    changes = await asyncio.to_thread(ladder.provisional, entries, mode)
+                                    registry.match_results[fields[1][0]] = (current.room_id, entries)
                                     while len(registry.match_results) > 256:
                                         del registry.match_results[next(iter(registry.match_results))]
-                                event = game_profile.match_results_event(fields[1][0], fields[1][2:], mode, changes)
+                                event = game_profile.match_results_event(fields[1][0], entries, mode, changes)
                                 payload = gsxor.encrypt(data.encode(["38", ["30", [fields[1][0]]]]))
                                 writer.write(response_header(header, payload, 0xd1) + payload)
-                                in_room = [member for member in registry.lobby_members(game_profile.product)
-                                           if member.group == str(current.room_id)]
                                 for member in in_room:
                                     member.send(event)
                                 await writer.drain()
-                                LOG.info("match results received game=%s peer=%s match=%s room=%d recipients=%d shape=%s",
+                                LOG.info("match results received game=%s peer=%s match=%s room=%d recipients=%d "
+                                         "dropped_non_members=%d shape=%s",
                                          game_profile.slug, peer, fields[1][0], current.room_id,
-                                         len(in_room), value_shape(fields[1][1:], limit=64))
+                                         len(in_room), dropped, value_shape(fields[1][1:], limit=64))
                                 continue
                             if (game_profile.lobby_create and host_room is not None
                                     and subtype in (15, 17, 30, 31, 33)):
@@ -1037,6 +1050,9 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                     registry.forget_match(host_room.room_id)
                                     match_id = registry.next_match_id(fields[1][1])
                                     registry.room_matches[host_room.room_id] = str(match_id)
+                                    registry.match_players[str(match_id)] = {
+                                        member.name.casefold() for member in registry.lobby_members(game_profile.product)
+                                        if member.group == str(host_room.room_id)}
                                     event = game_profile.match_started_event(host_room, match_id)
                                     in_room = [member for member in registry.lobby_members(game_profile.product)
                                                if member.group == str(host_room.room_id)]

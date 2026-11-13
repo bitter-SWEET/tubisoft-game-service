@@ -67,11 +67,13 @@ class RoomRegistryTests(unittest.TestCase):
             match_id = str(registry.next_match_id("3"))
             registry.room_matches[owned.room_id] = match_id
             registry.match_results[match_id] = (owned.room_id, [])
+            registry.match_players[match_id] = {owned.owner}
         kept = registry.room_matches[other.room_id]
         registry.remove(room.room_id, room.owner, room.peer_ip)
         self.assertEqual(registry.room_matches, {other.room_id: kept})
         self.assertEqual(list(registry.match_results), [kept])
         self.assertEqual(list(registry.match_modes), [kept])
+        self.assertEqual(list(registry.match_players), [kept])
         self.assertIsNone(registry.forget_match(room.room_id))
 
     def test_room_requires_owner_activation_and_disappears_on_remove(self):

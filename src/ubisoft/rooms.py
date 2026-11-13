@@ -86,6 +86,9 @@ class RoomRegistry:
         # its match is recorded, replaced or the room is removed.
         self.match_results: dict[str, tuple[int, list]] = {}
         self.room_matches: dict[int, str] = {}
+        # Case-folded names of the players who were in a match's room at any
+        # point since its operation 17; only they can be rated for it.
+        self.match_players: dict[str, set[str]] = {}
         self._next_id = 1000
         self._remove_listeners: set[Callable[[Room], None]] = set()
         self.worker_provider = None
@@ -209,6 +212,7 @@ class RoomRegistry:
         if match_id is not None:
             self.match_results.pop(match_id, None)
             self.match_modes.pop(match_id, None)
+            self.match_players.pop(match_id, None)
         return match_id
 
     def next_match_id(self, mode: str | None = None) -> int:

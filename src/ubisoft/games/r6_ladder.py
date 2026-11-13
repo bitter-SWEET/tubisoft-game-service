@@ -133,6 +133,9 @@ def summarize(entries: list, mode: str | None) -> list[Summary]:
                 raise ValueError("invalid R6 match result header")
         fields = [_value(value, field_id) for field_id, value in enumerate(entry[4])] + [0] * (20 - len(entry[4]))
         players.append((entry[0], fields))
+    names = [name.casefold() for name, _ in players]
+    if len(set(names)) != len(names):
+        raise ValueError("duplicate R6 match result player")
     team_mode = mode in TEAM_MODES
     # Survival modes have no respawn: a team with a player who did not die is
     # still standing, and it wins when it is the only one.

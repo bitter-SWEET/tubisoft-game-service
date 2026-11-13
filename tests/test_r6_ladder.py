@@ -52,6 +52,9 @@ class EloTests(unittest.TestCase):
             fields[field_id] = value
             with self.subTest(field=field_id, value=value), self.assertRaises(ValueError):
                 summarize([["One", "19", "20", "1048575", fields]], "3")
+        # A player may appear only once in a report.
+        with self.assertRaises(ValueError):
+            summarize([entry("One", 5), entry("ONE", 6)], "3")
         fields = ["255"] + ["9999"] * 18 + ["86400"]
         (top,) = summarize([["One", "19", "20", "1048575", fields]], "3")
         self.assertEqual((top.kills, top.deaths, top.seconds), (16 * 9999, 9999, 86400))
