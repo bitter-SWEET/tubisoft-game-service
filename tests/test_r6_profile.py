@@ -751,6 +751,39 @@ class R6ParentMemberTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(fields[:1] + fields[1][:3], ["50", "HostFixture", "0", "1"])
                 _, fields = await watcher.receive()
                 self.assertEqual(fields, ["55", [second]])
+
+                # The owner may leave a room it created before its self-join
+                # (operation 24): the game is removed and it can create again.
+                await host.send(0xd1, ["12", r6_create()])
+                _, fields = await host.receive()
+                third = fields[1][1][0]
+                _, fields = await watcher.receive()
+                self.assertEqual([child[2] for child in fields[1][3]], [third])
+                _, fields = await watcher.receive()
+                self.assertEqual(fields[:1] + fields[1][:3], ["50", "HostFixture", "0", third])
+                await host.send(0xd1, ["8", [third]])
+                _, fields = await host.receive()
+                self.assertEqual(fields, ["38", ["8", [third]]])
+                _, fields = await watcher.receive()
+                self.assertEqual(fields, ["51", ["HostFixture", third]])
+                _, fields = await watcher.receive()
+                self.assertEqual(fields[:1] + fields[1][:3], ["50", "HostFixture", "0", "1"])
+                _, fields = await watcher.receive()
+                self.assertEqual(fields, ["55", [third]])
+
+                # An owner disconnect is a departure, then the game's removal.
+                await host.send(0xd1, ["12", r6_create()])
+                _, fields = await host.receive()
+                fourth = fields[1][1][0]
+                self.assertNotEqual(fourth, third)
+                await watcher.receive()
+                await watcher.receive()
+                host.writer.close()
+                await host.writer.wait_closed()
+                _, fields = await watcher.receive()
+                self.assertEqual(fields, ["51", ["HostFixture", fourth]])
+                _, fields = await watcher.receive()
+                self.assertEqual(fields, ["55", [fourth]])
             finally:
                 for client in clients:
                     client.writer.close()

@@ -3,8 +3,9 @@
 Tom Clancy's Rainbow Six 3 for PS2 (`SLUS-20883`) links the same Ubisoft GS SDK
 family as Ghost Recon 2. Its sign-in sequence, bootstrap dialect, ranking proxy
 and lobby records match GR2 closely. Its game-hosting path instead resembles
-XIII's launcher registration. Everything below is **static** evidence from the
-owned disc's executables. No retail client has been run against Tubisoft yet.
+XIII's launcher registration. The early sections are **static** evidence from
+the owned disc's executables. Later sections also record retail runs: two
+unmodified clients in PCSX2 against a Tubisoft instance.
 
 Evidence labels follow [the GR2 notes](ghost-recon-2-network.md):
 **Static** (traced instructions/data on this disc), **Capture** (a related
@@ -776,10 +777,11 @@ R6 also has DEDICATE and DEDICATE LOBBY sign-in stages, so the retail
 client may look for dedicated servers too. The `0x00541c70` branches
 that choose between them are **Pending**.
 
-`supports_rooms` remains false. Before enabling it, map the join request,
-game-start (`56`) fields, player-info blob and member notifications from
-this disc. Do not reuse XIII's group flag `0x08`, four-byte player port or
-member-event layout until the R6 readers confirm them.
+The retail client did not use this launcher path. It creates games with
+lobby operation 12 and joins them with operation 24 (see Creating a game and
+Player counts and joining), so `supports_rooms` is now true for R6. XIII's
+group flag `0x08`, four-byte player port and member-event layout are not
+reused.
 
 ## Comparison capture
 
@@ -799,7 +801,12 @@ version `RSPS21.0`, default ports 30020 TCP/UDP, 30021 TCP and 30022 UDP,
 the `[Servers]` bootstrap, discovery, empty notices, the ladder proxy and
 ranking tables, parent-lobby join and the 24-byte parent player record. Rooms
 are created through lobby operation 12, and parent members are announced with
-operations 50 and 51. Guest joins remain incomplete.
+operations 50 and 51. Guests join with operation 24. Two retail clients have
+hosted and joined games in both directions, played rounds, and had results
+recorded on the Tubisoft ladder. The friends, messages, ignore list and
+country settings work too. Remaining limitations: tests used two players on
+PCSX2; the DEDICATE stages are untraced; the lobby player count is not pushed
+live; and ratings use Tubisoft's own Elo formula, not Ubisoft's.
 
 ```sh
 TUBISOFT_GAMES=xiii,r6 ...
@@ -809,19 +816,23 @@ curl --noproxy '*' 'http://127.0.0.1:18080/gsinit.php?dp=RAINBOWSIX3PS2US'
 
 `tests/test_r6_profile.py` covers the static shapes. It also runs the
 real-socket sequence above: shared XIII/R6 account, discovery, notices with
-`ge`, proxy ranking query and lobby login. A second real-socket test checks
-that a guest receives the room owner as a member and that the owner receives
-the guest's player data and departure.
+`ge`, proxy ranking query and lobby login. A second real-socket test covers
+a guest joining, the room's member records, player data, match start and
+results, friends and personal info, and leaving. It also covers an owner
+leaving a room before its self-join and an owner disconnecting, both of
+which remove the game from other members' lists.
+
+Notifications to another player's connection are bounded: a recipient whose
+unsent backlog would exceed 256 KiB has stopped reading and is disconnected
+(`router.NOTIFICATION_BACKLOG_LIMIT`).
 
 ## Next retail checks
 
-1. Boot R6 in PCSX2 with DNS for `gsconnect.ubisoft.com` pointed at the
-   instance. Confirm the bootstrap request and sign-in through the ladder
-   stage in the server logs.
-2. Confirm the LADDER stage now succeeds with the type-2 `ALIAS`/`LEVEL`
-   rows and see whether `LEVEL` 0 displays sensibly in the menus.
-3. Record the first `UnsupportedOperation` log after LADDER. It shows which
-   DEDICATE or lobby request the profile needs next.
-4. Trace that operation's sender and reader in `MP.SOZ` before implementing
-   it. A read-only PCSX2 RAM dump of the online state is useful when a reader
-   depends on runtime objects.
+1. Check the ladder `COUNTRY_ID` column and the ladder screen's country
+   filter.
+2. Play with more than two players and confirm room counts, results and
+   ratings.
+3. Trace the DEDICATE and DEDICATE LOBBY branches of `0x00541c70`.
+4. For any new `unsupported lobby request` log, trace its sender and reader
+   in `MP.SOZ` before implementing it. A PCSX2 save state of the online state
+   is useful when a reader depends on runtime objects.

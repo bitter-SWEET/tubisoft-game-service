@@ -39,6 +39,12 @@ class HostAliasTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             service.configuration({"TUBISOFT_ADVERTISE_IP": "198.51.100.10", "TUBISOFT_HOST_ALIAS": "bad"})
 
+    def test_compose_forwards_the_setting(self):
+        # Compose reads .env only for interpolation; the service environment
+        # must name the variable for it to reach the container.
+        compose = (Path(__file__).resolve().parents[1] / "compose.yaml").read_text()
+        self.assertIn("TUBISOFT_HOST_ALIAS: ${TUBISOFT_HOST_ALIAS:-auto}", compose)
+
     def test_nat_reports_the_alias_but_replies_to_the_real_source(self):
         discovery = nat.Discovery("0.0.0.0/0", host_alias=hostalias.HostAlias("203.0.113.1", "198.51.100.10"))
         self.assertEqual(discovery.host_alias("203.0.113.1"), "198.51.100.10")

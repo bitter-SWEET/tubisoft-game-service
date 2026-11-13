@@ -26,6 +26,11 @@ from .access import AccessPolicy
 LOG = logging.getLogger("ubisoft.router")
 KEY_EXCHANGE = 0xDB
 PARENT_LOBBY = XIII.parent_lobby()  # Compatibility for existing protocol fixtures.
+# Notifications are written to other players' connections, which the sending
+# handler does not drain. A recipient whose unsent bytes would exceed this
+# bound has stopped reading: it is disconnected instead of growing the
+# shared process's memory (normal pushes are well under 1 KiB each).
+NOTIFICATION_BACKLOG_LIMIT = 256 * 1024
 
 
 def response_header(request: GSHeader, payload: bytes, message_type: int | None = None) -> bytes:
@@ -37,6 +42,26 @@ def response_header(request: GSHeader, payload: bytes, message_type: int | None 
 def make_frame(request: GSHeader, fields: list) -> bytes:
     payload = gsxor.encrypt(data.encode(fields))
     return response_header(request, payload) + payload
+
+
+def queue_notification(writer, frame: bytes, peer, kind: str) -> bool:
+    """Queue an unsolicited frame for a connection, bounding its backlog."""
+    transport = writer.transport
+    if transport is None or transport.is_closing():
+        LOG.info("%s notification skipped peer=%s: connection already closed", kind, peer)
+        return False
+    backlog = transport.get_write_buffer_size()
+    if backlog + len(frame) > NOTIFICATION_BACKLOG_LIMIT:
+        LOG.warning("%s notification backlog exceeded peer=%s queued=%d limit=%d; disconnecting",
+                    kind, peer, backlog, NOTIFICATION_BACKLOG_LIMIT)
+        transport.abort()
+        return False
+    try:
+        writer.write(frame)
+    except (ConnectionError, OSError):
+        LOG.info("%s notification skipped peer=%s: connection already closed", kind, peer)
+        return False
+    return True
 
 
 def value_shape(value, depth: int = 0, limit: int = 16) -> str:
@@ -110,10 +135,8 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
     def wait_push(message_type: int, fields: list) -> None:
         # Unsolicited wait-module message (server 1 -> client 4).
         payload = gsxor.encrypt(data.encode(fields))
-        try:
-            writer.write(GSHeader(HEADER_SIZE + len(payload), 0, 1, message_type, 1, 4).encode() + payload)
-        except (ConnectionError, OSError):
-            LOG.info("friends notification skipped peer=%s: connection already closed", peer)
+        queue_notification(writer, GSHeader(HEADER_SIZE + len(payload), 0, 1, message_type, 1, 4).encode() + payload,
+                           peer, "friends")
 
     def release_friend_channel() -> None:
         if wait_user is not None:
@@ -177,10 +200,8 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
 
     def lobby_send(event: list) -> None:
         payload = gsxor.encrypt(data.encode(event))
-        try:
-            writer.write(GSHeader(HEADER_SIZE + len(payload), 0, 1, 0xd1, 2, 4).encode() + payload)
-        except (ConnectionError, OSError):
-            LOG.info("lobby notification skipped peer=%s: connection already closed", peer)
+        queue_notification(writer, GSHeader(HEADER_SIZE + len(payload), 0, 1, 0xd1, 2, 4).encode() + payload,
+                           peer, "lobby")
 
     def lobby_publish() -> None:
         # Announce this member's current record to the other parent members.
@@ -239,11 +260,9 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
         join_endpoint_sent = False
         host_member_notified = False
         payload = gsxor.encrypt(data.encode(["55", [str(room.room_id)]]))
-        try:
-            writer.write(GSHeader(HEADER_SIZE + len(payload), 0, 1, 0xd1, 2, 4).encode() + payload)
+        if queue_notification(writer, GSHeader(HEADER_SIZE + len(payload), 0, 1, 0xd1, 2, 4).encode() + payload,
+                              peer, "room-closed"):
             LOG.info("room-closed notification sent peer=%s room=%d; sign-in session retained", peer, room.room_id)
-        except (ConnectionError, OSError):
-            LOG.info("room-closed notification skipped peer=%s: connection already closed", peer)
         if game_profile.lobby_members:
             lobby_set_group("1")
 
@@ -1173,6 +1192,10 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                     allowed.add(str(joined_room.room_id))
                                 if closed_room_id is not None:
                                     allowed.add(str(closed_room_id))
+                                if host_room is not None:
+                                    # The owner may leave a room it created
+                                    # (operation 12) before its self-join (24).
+                                    allowed.add(str(host_room.room_id))
                                 if group_id not in allowed:
                                     LOG.info("room leave ignored peer=%s: group not associated with this session", peer)
                                     continue
