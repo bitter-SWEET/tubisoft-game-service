@@ -270,11 +270,12 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
         # The owner's end-of-round report finishes the room's current match:
         # its latest results update the ladder, and the room's members get
         # the final statistics with the rating and level changes.
-        match_id = registry.room_matches.pop(room.room_id, None)
-        pending = registry.match_results.pop(match_id, None) if match_id else None
+        match_id = registry.room_matches.get(room.room_id)
+        pending = registry.match_results.get(match_id) if match_id else None
+        mode = registry.match_modes.get(match_id) if match_id else None
+        registry.forget_match(room.room_id)
         if pending is None or pending[0] != room.room_id:
             return
-        mode = registry.match_modes.get(match_id)
         changes = await asyncio.to_thread(ladder.record, pending[1], mode)
         event = game_profile.match_results_event(match_id, pending[1], mode, changes)
         in_room = [member for member in registry.lobby_members(game_profile.product)
@@ -1033,8 +1034,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                          game_profile.slug, peer, host_room.room_id, subtype, host_room.game_port)
                                 if game_profile.lobby_members and subtype == 17:
                                     # A new round drops the unfinished one's results.
-                                    previous = registry.room_matches.pop(host_room.room_id, None)
-                                    registry.match_results.pop(previous, None)
+                                    registry.forget_match(host_room.room_id)
                                     match_id = registry.next_match_id(fields[1][1])
                                     registry.room_matches[host_room.room_id] = str(match_id)
                                     event = game_profile.match_started_event(host_room, match_id)

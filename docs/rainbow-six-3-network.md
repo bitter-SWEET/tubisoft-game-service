@@ -676,8 +676,10 @@ Recording:
   room's latest operation 17 started. Another player's report is ignored
   without a reply. The owner's report for a finished or replaced match is
   acknowledged but neither stored nor broadcast.
-- A round that is abandoned (a new operation 17 with no operation 45) is
-  not recorded.
+- A round that is abandoned (a new operation 17 with no operation 45, or
+  the room removed first) is not recorded. Its match ID, mode and latest
+  results are dropped with it, so abandoned rounds leave no state behind
+  (`RoomRegistry.forget_match`).
 - Each player with an account gets a row on the mode's ladder and on
   ladder 0 (table `r6_ladder` in the account database). The row holds the
   rating, the counters (frag score, kills, deaths, team kills, rounds, team

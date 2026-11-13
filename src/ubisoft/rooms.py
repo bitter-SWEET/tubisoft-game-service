@@ -82,7 +82,8 @@ class RoomRegistry:
         # Operation 17 state (game mode) of recent matches by match ID.
         self.match_modes: dict[str, str] = {}
         # Latest results of unfinished matches: match ID -> (room ID, entries),
-        # and each room's current match ID.
+        # and each room's current match ID. A room's entries are dropped when
+        # its match is recorded, replaced or the room is removed.
         self.match_results: dict[str, tuple[int, list]] = {}
         self.room_matches: dict[int, str] = {}
         self._next_id = 1000
@@ -193,6 +194,7 @@ class RoomRegistry:
             del self._rooms[room_id]
             room.active = False
             room.host_connections.clear()
+            self.forget_match(room_id)
             for listener in tuple(self._remove_listeners):
                 listener(room)
 
@@ -200,6 +202,14 @@ class RoomRegistry:
         self.sync_worker()
         room = self._rooms.get(room_id)
         return room if room is not None and room.active and (product is None or room.product == product) else None
+
+    def forget_match(self, room_id: int) -> str | None:
+        """Drop a room's current match and its unrecorded state."""
+        match_id = self.room_matches.pop(room_id, None)
+        if match_id is not None:
+            self.match_results.pop(match_id, None)
+            self.match_modes.pop(match_id, None)
+        return match_id
 
     def next_match_id(self, mode: str | None = None) -> int:
         match_id = self._next_match
