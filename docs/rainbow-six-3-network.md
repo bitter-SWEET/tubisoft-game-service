@@ -676,6 +676,11 @@ Recording:
   room's latest operation 17 started. Another player's report is ignored
   without a reply. The owner's report for a finished or replaced match is
   acknowledged but neither stored nor broadcast.
+- The game only counts up, and no retail report held a negative value. A
+  report with a negative or non-decimal value, or one above a field's bound,
+  is rejected before anything is rated, stored or broadcast, and the
+  connection is closed. The bounds are 255 for the team, 9,999 for each kill,
+  death and team-kill count, and 86,400 seconds (`r6_ladder.FIELD_LIMITS`).
 - A round that is abandoned (a new operation 17 with no operation 45, or
   the room removed first) is not recorded. Its match ID, mode and latest
   results are dropped with it, so abandoned rounds leave no state behind

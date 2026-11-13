@@ -44,6 +44,17 @@ class EloTests(unittest.TestCase):
         self.assertEqual(one, Summary("One", 5, 1, 2, 3, 1, 1, 0, 0, 90))
         with self.assertRaises(ValueError):
             summarize([["One", "19", "20", "1", ["x"]]], "3")
+        # The game only counts up: negative and out-of-range values are
+        # rejected before anything is rated or stored.
+        for field_id, value in ((1, "-1"), (17, "-5"), (18, "-1"), (19, "-30"), (0, "256"),
+                                (5, "10000"), (19, "86401"), (3, "+1"), (3, "\uff11")):
+            fields = ["0"] * 20
+            fields[field_id] = value
+            with self.subTest(field=field_id, value=value), self.assertRaises(ValueError):
+                summarize([["One", "19", "20", "1048575", fields]], "3")
+        fields = ["255"] + ["9999"] * 18 + ["86400"]
+        (top,) = summarize([["One", "19", "20", "1048575", fields]], "3")
+        self.assertEqual((top.kills, top.deaths, top.seconds), (16 * 9999, 9999, 86400))
 
     def test_levels_follow_the_rating(self):
         self.assertEqual([level(r) for r in (0, 1000, 1049, 1050, 1749, 1750, 9999)], [0, 0, 0, 1, 14, 15, 15])

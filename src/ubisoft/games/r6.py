@@ -1,9 +1,14 @@
-"""Rainbow Six 3 (PS2) sign-in, discovery, ranking startup and parent lobby; rooms remain research.
+"""Rainbow Six 3 (PS2): sign-in, discovery, ranking, parent lobby, rooms and matches.
 
 Addresses refer to the expanded multiplayer image (``MP.SOZ`` inflated to
 ``0x00100000``; GP ``0x0065cf70``) of ``SLUS-20883``. See
 docs/rainbow-six-3-network.md for the evidence and the remaining gaps.
-Opting in enables shared GS authentication experiments, not working multiplayer.
+The profile is experimental and opt-in. Two retail clients have created and
+joined lobby rooms (operations 12 and 24), played rounds whose results feed
+Tubisoft's own Elo ladder, and used friends, messages, the ignore list and
+the profile country. Remaining gaps: only two-player games have been tested,
+the DEDICATE sign-in stages are untraced, and the lobby player count is not
+pushed live.
 """
 import ipaddress
 

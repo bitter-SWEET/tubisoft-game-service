@@ -93,10 +93,23 @@ class Summary:
     seconds: int
 
 
-def _value(value) -> int:
-    if not isinstance(value, str) or not value.lstrip("-").isdecimal() or len(value) > 11:
+# Upper bound of each operation 30 value by field ID. The game only counts
+# up (team, kills by victim level, deaths, team kills, seconds), so negative
+# values are rejected; the bounds are far above any real round (61 retail
+# reports never exceeded a few hundred) and keep a forged report from
+# swamping the stored counters and ratings.
+FIELD_LIMITS = (255,) + (9_999,) * 16 + (9_999, 9_999, 86_400)
+EXTRA_FIELD_LIMIT = 2**31 - 1  # IDs past 19 are not used by the ladder
+
+
+def _value(value, field_id: int) -> int:
+    if not isinstance(value, str) or not value.isascii() or not value.isdecimal() or len(value) > 10:
         raise ValueError("invalid R6 match result value")
-    return int(value)
+    number = int(value)
+    limit = FIELD_LIMITS[field_id] if field_id < len(FIELD_LIMITS) else EXTRA_FIELD_LIMIT
+    if number > limit:
+        raise ValueError("R6 match result value out of range")
+    return number
 
 
 def summarize(entries: list, mode: str | None) -> list[Summary]:
@@ -118,7 +131,7 @@ def summarize(entries: list, mode: str | None) -> list[Summary]:
         for value in entry[1:4]:
             if not isinstance(value, str) or not value.isdecimal() or len(value) > 10:
                 raise ValueError("invalid R6 match result header")
-        fields = [_value(value) for value in entry[4]] + [0] * (20 - len(entry[4]))
+        fields = [_value(value, field_id) for field_id, value in enumerate(entry[4])] + [0] * (20 - len(entry[4]))
         players.append((entry[0], fields))
     team_mode = mode in TEAM_MODES
     # Survival modes have no respawn: a team with a player who did not die is
