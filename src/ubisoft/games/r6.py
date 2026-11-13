@@ -24,6 +24,7 @@ def _decimal(value: str, maximum: int) -> int:
 
 
 class R6Profile(GameProfile):
+    _ladders: dict = {}  # stored ladders by account database (class-level)
     def registration(self, fields: list, peer_ip: str) -> RoomSpec:
         # Lobby operation 12, sender 0x00417dd0: parent ID, room name,
         # product, three u16 values, game data, password, two version
@@ -68,14 +69,24 @@ class R6Profile(GameProfile):
         return flags
 
     # Senders 0x00419440 (34), 0x00419270 (35), 0x004184b0 (44), 0x00418320
-    # (45) and 0x00418640 (70) each send only the room ID and none has a
-    # completion reader. The host sends 34 about three seconds after
-    # creating a room, while its match loads.
+    # (45) and 0x00418640 (70) each send only the room ID. The host sends 34
+    # about three seconds after creating a room, while its match loads; 44
+    # follows operation 62 (0x00402100) and the round-end handler 0x00475e50
+    # sends 70 (0x004020c0) and, from the owner, 45 (0x00402860). Only 45 has
+    # a completion reader (dispatcher 0x0040e470 -> 0x00424410).
     room_notice_subtypes = (34, 35, 44, 45, 70)
 
     def room_notice(self, room, subtype: int, values: list) -> None:
         if values != [str(room.room_id)]:
             raise ValueError("R6 room report does not name the joined room")
+
+    def room_notice_reply(self, room, subtype: int) -> list | None:
+        # Reader 0x00424410 reads ["38", ["45", [number]]] and callback slot
+        # +0x4c (0x004027e0) completes the owner's end-of-round request state
+        # (+0x15c), which 0x00402860 left pending.
+        if subtype == 45:
+            return ["38", ["45", [str(room.room_id)]]]
+        return None
 
     def room_update(self, room, subtype: int, values: list) -> list:
         # Owner-only room operations issued through 0x0042a1d0. Their readers
@@ -116,6 +127,51 @@ class R6Profile(GameProfile):
             raise ValueError("unsupported R6 room update")
         return [str(room.room_id)]
 
+    def match_started_event(self, room, match_id: int) -> list:
+        # Reader 0x0041e1b0 (operation 62) -> callback 0x00402320: room ID and
+        # match ID. The callback stores the match ID (+0x10c) and sets the
+        # flag (+0x18d) that end-of-match handler 0x00400520 requires before
+        # it submits operation 30. The owner's operation 17 (0x00402990)
+        # clears that flag, so every member needs this event per match.
+        return ["62", [str(room.room_id), str(match_id)]]
+
+    def match_ladder(self, account_db):
+        from .r6_ladder import R6Ladder
+        ladders = R6Profile._ladders
+        if account_db not in ladders:
+            ladders[account_db] = R6Ladder(account_db)
+        return ladders[account_db]
+
+    def match_results_event(self, match_id: str, entries: list, mode: str | None = None,
+                            changes: dict | None = None) -> list:
+        # Pushed operation 71 (reader 0x00426040 -> callback slot +0xb4,
+        # 0x00400c40) carries [match ID, result, [[name, [values]], ...]].
+        # The callback ignores a match ID other than the one from operation
+        # 62 (+0x10c), keeps the records (+0x200), copies the first 12 values
+        # (0x30 bytes, whatever the count) into the player's statistics
+        # (+0x1c8 entry +0x24, 0x00400e10) and completes the results request
+        # (+0x17c). Value 0 is added to the player's level for the room's
+        # ladder (+0x1f8), clamped to 0-15. The scoreboard row filler
+        # 0x00478590 shows value 3 (0x00400300, KILLS, the operative column in
+        # retail run 19) and value 1 (0x00400410, RATING); 0x003f63b0 picks
+        # the player with the highest value 3. The values follow the ladder
+        # columns after GLOBAL_RANK and ALIAS (table 0x0058f4c0): LEVEL,
+        # RATING, FRAGSCORE, KILLS, DEATHS, RATIO, TEAMKILLS, ROUND,
+        # TEAMROUND, TEAMWIN, TEAMRATIO, TIMEPLAYED. LEVEL and RATING carry
+        # this match's changes from the Tubisoft Elo ladder (r6_ladder.py);
+        # the per-match ratios are 0.
+        from .r6_ladder import summarize
+        _decimal(match_id, 0xffffffff)
+        changes = changes or {}
+        records = []
+        for player in summarize(entries, mode):
+            rating, level_change = changes.get(player.name.casefold(), (0, 0))
+            values = [level_change, rating, player.frag_score, player.kills, player.deaths, 0,
+                      player.team_kills, player.rounds, player.team_rounds, player.team_wins, 0,
+                      player.seconds]
+            records.append([player.name, [str(value) for value in values]])
+        return ["71", [match_id, "38", records]]
+
     def lobby_member_event(self, member) -> list:
         # Reader 0x004237f0 (operation 50) -> callback 0x004034a0: name, a
         # flag character, one group ID, two address strings, binary player
@@ -135,11 +191,12 @@ class R6Profile(GameProfile):
     def login_notices(self, fields: list) -> list:
         # 0x00410aa0 sends 0xde with one language string. Reader 0x00411f80
         # requires a nested list at field 1 holding two strings, each bounded
-        # to a 0x201-byte buffer. No service notices are configured.
+        # to a 0x201-byte buffer. The game lists them as "Latest News" items
+        # 1 and 2 (retail run 22 showed both numbers with empty text).
         if (len(fields) != 1 or not isinstance(fields[0], str)
                 or fields[0] not in LANGUAGES):
             raise ValueError("unsupported R6 notice language")
-        return ["", ""]
+        return list(self.news)
 
     def discovery_login(self, fields: list) -> None:
         # 0x00417500 sends 0xd1 ["21", [product]].
@@ -147,12 +204,18 @@ class R6Profile(GameProfile):
         if fields != [self.product]:
             raise ValueError("unsupported R6 discovery product")
 
-    def parent_lobby(self) -> list:
+    def parent_lobby(self, players: int = 0) -> list:
         # Folder reader 0x00416f00 consumes 14 fields: u32 ID, name (33),
         # four numbers, u32, strings of 16/132/99 bytes, binary data, then
-        # three numbers. The 20-field child-game reader is 0x00416c20.
+        # three numbers. The 20-field child-game reader is 0x00416c20. Its
+        # last three numbers line up with the child record's fields 11-13,
+        # so field 13 carries the players in the lobby (field 12 the limit).
+        # Member events (0x004034a0) count only games (IDs <= 0), so the
+        # lobby list shows this number as sent. Updates (operation 54,
+        # 0x00421cd0) go to callback slot +0x24, which R6 never registers:
+        # the count changes when the list is fetched again.
         return ["0", self.display_name, "1", "1", "0", "0", "1", "", "",
-                self.product, b"", "0", "8", "0"]
+                self.product, b"", "0", "8", str(players)]
 
     def join_parent_lobby(self, fields: list) -> list:
         # Sender 0x004177e0 issues operation 23 through 0x0042a1d0 with group
@@ -227,6 +290,8 @@ PROFILE = R6Profile(
     game_version="1.0", sdk_version="RSPS21.0", default_ports=(30020, 30021, 30022),
     supports_discovery=True, supports_rooms=True, lobby_create=True, owner_game_started=False,
     lobby_members=True,
+    news=("Welcome to Tubisoft, a community revival of the Rainbow Six 3 online service.",
+          "Ladder ratings use Tubisoft's own Elo system, not Ubisoft's original formula."),
     # Game rooms have non-positive IDs: member callbacks 0x004034a0/0x00403220
     # count players (entry +0xcc, shown as the list's current players) and
     # set the in-room state only for IDs <= 0, and the group-change callback

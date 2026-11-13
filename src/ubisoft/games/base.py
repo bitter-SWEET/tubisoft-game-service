@@ -54,6 +54,9 @@ class GameProfile:
     negative_room_ids: bool = False
     # Whether joining guests receive GAME_STARTED (operation 56).
     game_started: bool = True
+    # The two login notices ("Latest News"); TUBISOFT_<SLUG>_NEWS_1/_2
+    # replace them (registry.bindings).
+    news: tuple[str, str] = ("", "")
     bootstrap_keys: tuple[str, ...] = (
         "routerip0", "routerport0", "routerlauncherport0", "natserverip0", "natserverport0")
 
@@ -119,6 +122,10 @@ class GameProfile:
     def room_notice(self, room: Room, subtype: int, values: list) -> None:
         raise UnsupportedOperation(f"{self.slug} room reports are not implemented")
 
+    def room_notice_reply(self, room: Room, subtype: int) -> list | None:
+        # Completion for a room report whose title has a reader for it.
+        return None
+
     def game_connected(self, room: Room, fields: list) -> None:
         raise UnsupportedOperation(f"{self.slug} game-connected notification is not implemented")
 
@@ -142,3 +149,14 @@ class GameProfile:
 
     def lobby_member_left(self, member) -> list:
         raise UnsupportedOperation(f"{self.slug} lobby member leave is not implemented")
+
+    def match_started_event(self, room: Room, match_id: int) -> list:
+        raise UnsupportedOperation(f"{self.slug} match start notifications are not implemented")
+
+    def match_results_event(self, match_id: str, entries: list, mode: str | None = None,
+                            changes: dict | None = None) -> list:
+        raise UnsupportedOperation(f"{self.slug} match result notifications are not implemented")
+
+    def match_ladder(self, account_db):
+        # Stored match ladder for titles whose results the service rates.
+        return None

@@ -73,6 +73,18 @@ class RoomRegistry:
     def __init__(self) -> None:
         self._rooms: dict[int, Room] = {}
         self._lobby: dict[object, LobbyMember] = {}
+        # Signed-in friends channels by case-folded name: (connection, send).
+        self.friend_channels: dict[str, tuple[object, Callable[[int, list], None]]] = {}
+        # Stored friends of each signed-in watcher, used for live presence
+        # updates: friend key -> (display name, group).
+        self.friend_lists: dict[str, dict[str, tuple[str, str]]] = {}
+        self._next_match = 1
+        # Operation 17 state (game mode) of recent matches by match ID.
+        self.match_modes: dict[str, str] = {}
+        # Latest results of unfinished matches: match ID -> (room ID, entries),
+        # and each room's current match ID.
+        self.match_results: dict[str, tuple[int, list]] = {}
+        self.room_matches: dict[int, str] = {}
         self._next_id = 1000
         self._remove_listeners: set[Callable[[Room], None]] = set()
         self.worker_provider = None
@@ -188,6 +200,15 @@ class RoomRegistry:
         self.sync_worker()
         room = self._rooms.get(room_id)
         return room if room is not None and room.active and (product is None or room.product == product) else None
+
+    def next_match_id(self, mode: str | None = None) -> int:
+        match_id = self._next_match
+        self._next_match += 1
+        if mode is not None:
+            self.match_modes[str(match_id)] = mode
+            while len(self.match_modes) > 1024:
+                del self.match_modes[next(iter(self.match_modes))]
+        return match_id
 
     def lobby_join(self, connection: object, member: LobbyMember) -> LobbyMember:
         return self._lobby.setdefault(connection, member)

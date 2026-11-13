@@ -160,6 +160,24 @@ player record. Game-room create and join (12, 24) remain unsupported. Note that
 R6 can create rooms through the lobby server (operation 12), as Splinter Cell
 Chaos Theory does, in addition to the launcher `0xd5` path below.
 
+### Lobby player count
+
+In the twenty-second run, the lobby list did not count a player who joined
+the Rainbow Six 3 lobby. Folder reader `0x00416f00` reads 14 fields. Its
+last three numbers line up with fields 11–13 of the 20-field game record
+(`0x00416c20`), where field 12 is the limit and field 13 the current
+players. The parent record always sent 0 there. Member events
+(`0x004034a0`) count players only for games (IDs ≤ 0), so they never change
+the lobby's count. Folder updates (operation 54, `0x00421cd0`, folder
+branch) go to callback slot `+0x24`, which R6 never registers. The count
+can therefore change only when the list is fetched again: operation 21 at
+discovery, 23 on joining, or 9.
+
+For R6, the parent record's field 13 is now the number of players in the
+lobby, including players in games and a player who is joining. Field 12
+stays 8. Whether the list shows field 13 as the current count, and whether
+8 acts as a limit, still need a retail check.
+
 ## Creating a game (lobby operation 12)
 
 The third retail run entered the empty parent lobby and selected Create Game.
@@ -316,6 +334,433 @@ the connection and the game signed out. The reply reader `0x0040fed0`
 four-byte error code. R6 now answers with the profile for any signed-in
 parent member and with `0x27 [0x13, [0x00000000]]` for an empty or unknown
 name. XIII's behaviour is unchanged.
+
+## Player search and ladder browsing
+
+In the eleventh run, browsing the ladder sent further ranking queries (type 2
+and type 3 selections). They received the existing empty or zero-value
+tables without errors. Searching for a player to add as a friend sent
+`0x08` with seven strings on the wait-module connection (sender
+`0x00412c50`: five strings, a `0`/`1`/`2` character and one more string).
+The router had no handler, so the connection closed.
+
+Reader `0x00413d80` accepts one result per `0x26` reply,
+`[0x08, [name, u32 status, product]]`. Callback `0x003fd3d0` keeps up to 20
+results in a `0xd0`-byte entry list. It treats `0x27` with error code `0x30`
+as the end of the search and any other code as a failure. The friends UI
+(`0x004e0700`, jump table `0x005cfa20`) shows status 0, 2, 3, 6 and 8 as
+online, 1 and 7 as offline, and 9–11 as in game. For 8–11 it also compares
+the product string with its own.
+
+R6 now searches the account names (case-insensitive substring of the first
+field, at most 20, excluding the searcher). Each match is reported as
+online (0) if the player is in the parent lobby, in game (9, with the
+product) if the player is in a room, and offline (1) otherwise. The search
+ends with `0x27 [0x08, [0x30 00 00 00]]`.
+
+## Friends list
+
+The twelfth run went from a search result to player info (`0x13` for an
+account that was not in the lobby, which got the failure reply), the
+player's ladder rows and then Add Friend. The client sent
+`0x4b [name, group, u32]` (sender `0x004127a0`), which had no handler.
+
+| Operation | Request | Reply | Client handling |
+|---|---|---|---|
+| Add `0x4b` | `[name, group, u32]` | `0x26 [0x4b, name]` / `0x27 [0x4b, [code]]` | reader `0x00412ea0`, callback `0x003fdc70` (state only) |
+| Remove `0x4c` | `[name]` | `0x26 [0x4c, name]` / `0x27` | reader `0x00412f70`, callback `0x003fdbe0` removes the entry (`0x003fcf50`) |
+| Friend record `0x4a` | pushed | `[name, u32 status, group, u32, u32, product]` | reader `0x00413bb0`, callback `0x003fdd90` builds a `0xd0`-byte entry (`0x003ff1c0`) and files it (`0x003fd0d0`) |
+
+The client adds a friend to its list only when it receives a `0x4a` record,
+not from the add reply. The callback slots come from the `clFriendsCB`
+vtable at `0x00606810`.
+
+The account database now has a `friends` table (owner, friend, group). It
+is created on first use, keeps the schema version, and allows at most 100
+friends per account. For R6:
+
+- friends login (`0x4e`) is followed by one `0x4a` record per stored friend;
+- a successful add replies with the friend's display name and pushes that
+  friend's `0x4a` record;
+- remove deletes the row;
+- player info (`0x13`) also answers for existing accounts that are not
+  signed in.
+
+Status comes from the lobby member directory: 0 if the friend is in the
+parent lobby, 9 with the product if in a room, otherwise 0 if the friend
+has a friends channel and 1 if not.
+
+In the fifteenth run, a friend in the same game still showed as offline: the
+status was computed only at friends login and when the friend was added. The
+service now keeps each signed-in watcher's stored friends and pushes a fresh
+`0x4a` record to every watcher of a player whose status changes: lobby
+announcements, room joins and departures, friends login and friends logout.
+`0x003fd0d0` first drops any entry with the same name (16-byte compare) and
+then files the record by status, so a repeated record updates the entry in
+place.
+
+## Messages and personal info
+
+In the thirteenth run, adding a friend and reloading the list worked. Sending
+a message sent `0x58 [[recipients], text]` (sender `0x00412a40`), and changing
+the account's country sent an encrypted `0x62` with six strings (sender
+`0x00410750`: an empty string and five profile fields). Neither had a
+handler, and each closed a connection.
+
+- `0x58` reply (reader `0x00413170`): `0x26 [0x58, name]` or
+  `0x27 [0x58, [code, name]]`.
+- Incoming messages are pushed as `0x65 [from, text, time]` (reader
+  `0x00413040` -> `0x003fca90`). The game keeps them in a 10-entry inbox of
+  `0x130`-byte records: sender at `+0x108`, text at `+0x08` (0x100 bytes) and
+  the time at `+0x118`. Parser `0x003fef10` reads fixed fields: year-1900
+  (3 digits), then month-1, day, hour, minute and second (2 digits each).
+  `0x005146c0` shows them as `Y-M-D h:mm GMT`, so 2026-11-12 22:05:40 UTC is
+  sent as `1261012220540`. The first retail run sent `HH:MM` and displayed
+  `1922-6-0 0:00 GMT`.
+- A `0x5a [from, [u32 length, bytes]]` reader exists (`0x00413470`). Its
+  callback slot (`+0x2c`) is never registered, so R6 ignores it.
+- `0x62` reply (reader `0x00411ea0`): `0x26 [0x62]` or `0x27 [0x62, [code]]`.
+
+R6 now records a friends channel per signed-in account at friends login.
+`0x58` delivers `0x65` to each recipient that has a channel. It replies
+success when all recipients received the message, and otherwise `0x27` with
+the first one that didn't. Offline messages are not stored. `0x62` is
+acknowledged. Its country is stored as described in "Country" below.
+
+In the fourteenth run, a message from PC2 reached PC1, but PC2 stayed on the
+Send Message screen. The server had sent `0x26 [0x58, [name]]`. Reader
+`0x00413170` and callback `0x003fdb60` set the send-message request state
+(friends object `+0x60`: bits 2 = finished, 4 = success), as the add-friend
+path does for `+0x50`. Native code never reads these states, so they are
+presumably polled from UnrealScript.
+
+A save state of the stuck PC2 showed `+0x60` still 0, while the friends
+module's current message (`+0x04`) was our `0x26` reply, so the reader ran
+but returned 0. The message tree uses value types 1 (string), 2 (binary) and
+3 (list). Reader helper `0x00466e10` returns an element only if it is a
+string (type 1), but the reply carried `[name]`, a list. Replies to `0x58`,
+`0x4b` and `0x4c` now carry the name as a plain string in field 1. Adding a
+friend had appeared to work only because the pushed `0x4a` record fills the
+list on its own.
+
+## Country
+
+After the ignore list, a changed country still did not persist. The
+profile screen (menu handler `0x00518af0` -> `0x00406f40` -> sender
+`0x00410750`) sends `0x62` with an empty string and five strings. The fifth
+is a country code: `0x005140e0` looks it up from the name chosen in the
+`P_country` list. Player info (`0x13`, reader `0x004110a0`) returns seven
+strings. Reader `0x004110a0` and callback `0x004068e0` -> `0x00407350` file
+them at player object (`gp[0x658804]`) `+0x228`, permuted:
+
+| `0x13` field | Offset | Size | `0x62` field | Personal Settings |
+| --- | --- | --- | --- | --- |
+| 0 | `+0x114` | 10 | — | — |
+| 1 | `+0x0` | 16 | — | alias |
+| 2 | `+0x10` | 33 | 3 | menu `+0x130` |
+| 3 | `+0x31` | 33 | 2 | menu `+0x124` |
+| 4 | `+0x52` | 65 | 5 (country code) | country (`+0x13c`) |
+| 5 | `+0x93` | 129 | 4 | menu `+0x148` |
+| 6 | `+0x11e` | 129 | — | — |
+
+Personal Settings (`0x00542e40`) shows `+0x52` as the country:
+`0x00514250` maps the code back to its `P_country` name, and an empty or
+unknown code shows "NO LIMIT". Sign-in requests the player's own info, so a
+server that echoes the code back in field 4 makes the choice persist.
+
+The first two attempts used fields 5 and 3, read from the argument order
+without the reader's permutation. A save state from the twenty-sixth run
+showed the code at `+0x31` (field 3) and the alias from field 0 at `+0x114`,
+which established the table above.
+
+R6 now stores only the country code (`countries` table, printable ASCII, at
+most 15 characters; empty clears it). The twenty-seventh run confirmed that
+the choice persists across sign-in. Ladder rows report the code's numeric
+`COUNTRY_ID` (see Ladders). Every `0x13` reply carries
+it in field 4, for the player's own info and for other players. The other four
+`0x62` fields may be personal details. They are neither stored nor logged;
+the log records only their lengths.
+
+## Ignore list
+
+In the twenty-third run, ignoring a player sent `0x4f [name]` (sender
+`0x00414880`). It had no handler, so the connection closed. The friends
+dispatcher (`0x0040dee0`) routes the ignore operations:
+
+| Operation | Request | Reply | Client handling |
+|---|---|---|---|
+| Ignore `0x4f` | `[name]` | `0x26 [0x4f, [name]]` / `0x27 [0x4f, [code, [name]]]` | reader `0x00414c60`, callback `0x003fd8b0` adds the name (friends object `+0x3c`) and completes `+0x80` |
+| Unignore `0x50` | `[name]` (sender `0x004149e0`) | same shape | reader `0x00415140`, callback `0x003fd700` removes the name and completes `+0x88` |
+| List `0x54` | empty | `0x26 [0x54]` | reader `0x004157f0`, callback `0x003fd680` completes `+0x90` |
+| Entry `0x55` | pushed | `[name]` | reader `0x004156b0`, callback `0x003fd4f0` adds the name if missing |
+
+Unlike `0x4b`, these readers take element 1 as a list. The failure codes
+0xd and 0xe map to specific errors; other codes are a generic failure.
+
+The account database now has an `ignores` table (owner, ignored), created
+on first use and limited to 100 entries per account. For R6:
+
+- `0x54` is followed by one `0x55` per stored entry.
+- `0x4f` and `0x50` update the table.
+- A message (`0x58`) from an ignored player is dropped, and the sender still
+  gets the normal success reply.
+
+Removing a friend (`0x4c`) returned straight to the menu, with no
+confirmation. The success reply completes the request, and callback
+`0x003fdbe0` removes the entry. What the screen shows afterwards is decided
+by the game's menu script, not the service.
+
+## Match start and results
+
+The fifteenth run had a full match but no scores, and the client never sent
+operation 30 (match results). The chain is:
+
+- End-of-match handler `0x00400520` submits results only when flag `+0x18d`
+  of the GS object (`gp[0x65883c]`) is set.
+- The owner's operation 17 (sender `0x00402990`, `[room, state]`, sent at
+  every round start) clears that flag before sending.
+- Only the operation 62 callback `0x00402320` sets it. Its reader
+  `0x0041e1b0` takes `["62", [room, match ID]]`. The callback stores the match
+  ID at `+0x10c`, rebuilds the room member list and republishes the player
+  data.
+- Results then go through `0x00401070` -> `0x0040b340` -> `0x0040ed80` ->
+  sender `0x00418ec0`, which sends operation 30 as `[room, results]` through
+  `0x0042a1d0`. The `MatchResults` object lives at GS client `+0x160` (ctor
+  `0x0040ec20`, add `0x00456370`, serialize `0x004568f0`: two numbers, then
+  one entry per player from `0x00457370`). Reader `0x0041e8c0` reads only
+  the room ID back.
+
+The service now answers the owner's operation 17 and then sends
+`["62", [room, match ID]]` to every member filed under the room, the owner
+included. Match IDs are a per-instance counter.
+
+In the sixteenth run (a Sharpshooter round), operation 62 enabled the
+results. The owner then sent operation 30 about every 15 seconds during the
+round, ending just before the round-end reports (70/45). Each message is
+`[group, lobby server, entry...]` with the parent group (`"1"`, `"0"`), not
+the room, and one entry per player. The entry (serializer `0x00457370`) is
+`[name, highest field ID, field count, field-ID bit mask, values]`. Retail
+sent field IDs 0–19 (`"19"`, `"20"`, `"1048575"`). Values are in field-ID
+order. `0x00456370` finds or adds the player's entry, and `0x00457280` sets
+one field and updates the mask and counts.
+
+In that run, field 0 stayed constant per player (6 and 5) and field 1 rose
+from 0 to 3 for both players as they scored. Fields 2–15 stayed 0, and
+fields 16–19 were cut off in the log. The ladder column names in `MP.SOZ`
+are `GLOBAL_RANK`, `ALIAS`, `LEVEL`, `RATING`, `FRAGSCORE`, `KILLS`,
+`DEATHS`, `RATIO`, `TEAMKILLS`, `ROUND`, `TEAMROUND`, `TEAMWIN`,
+`TEAMRATIO`, `TIMEPLAYED` and `COUNTRY_ID`. The ladder names are
+`SURVIVAL`, `TEAM SURVIVAL` and `SHARP SHOOTER`. The script that fills each
+field ID lives outside `MP.SOZ`, so the mapping has to come from retail
+results.
+
+Operation 30 is acknowledged with `["38", ["30", [first value]]]`.
+
+The seventeenth run (one Sharpshooter round, then Survival rounds hosted
+by the other PC) showed what the two leading values are. The first is the
+match ID from operation 62 (1 for the first match, then 2, 3 and 4 for
+each Survival round), not the parent group. `0x00400520` creates the
+results with that ID (`+0x10c`) and 0, then adds fields 0–19 for each
+player in its statistics list (`+0x1c8`). Field meanings seen so far:
+
+| Field | Meaning |
+| --- | --- |
+| 0 | Team (5 and 6 in Sharpshooter and Survival, 2 and 3 in Team Survival) |
+| 1–16 | Kills, by the victim's level (0–15) for the room's ladder |
+| 17 | Deaths |
+| 18 | Team kills, suicides included |
+| 19 | Seconds played in the round |
+
+Kill recorder `0x004006d0` (from native `0x0035e120`) explains the fields.
+For a kill of another team it adds a death to the victim and one to the
+killer's field 1 + victim level. For a same-team kill, including a
+suicide, it adds a death and a team kill to the killer. `0x00400610` sets
+field 19. In the eighteenth run, a suicide added a death and a team kill
+and left the kills unchanged.
+
+The owner's operation 17 state is the game mode: 1 Survival, 2 Team
+Survival, 3 Sharpshooter. Each Survival and Team Survival round is a
+separate match.
+
+Both players reported that the scoreboard (Start) showed no scores and no
+end-of-round message appeared. Two client paths were waiting on the
+service:
+
+- Pushed operation 71 (reader `0x00426040`, callback slot `+0xb4`,
+  `0x00400c40`) carries `[match ID, result, [[name, [values]], ...]]`.
+  The callback ignores any match ID other than its own (`+0x10c`), stores
+  the records (`+0x200`), and merges them into the per-player statistics
+  (`0x00400e10`). It then completes the results request (`+0x17c`) that
+  `0x00401130` reset before each submission. The merge copies the first
+  12 values and adds value 0 to the player's level for the room's ladder
+  (`+0x1f8`), clamped to 0–15. `0x00400ae0` then copies the levels to the
+  lobby member (`+0x12c`). Value 0 is therefore a level change.
+- The owner's operation 45 (`0x00402860`, round end) leaves a request
+  state (`+0x15c`) pending. Reader `0x00424410` takes
+  `["38", ["45", [number]]]`, and callback `0x004027e0` completes it.
+
+The service now pushes operation 71 to every member of the sender's room
+after each operation 30, and completes operation 45 with the room ID.
+Operations 34, 35, 44 and 70 have no reader in the dispatcher
+(`0x0040e470`) and stay one-way.
+
+The eighteenth run, which echoed the submitted fields, showed scores on
+both PCs. Echoing is wrong, though. Scoreboard row filler `0x00478590`
+shows value 3 (`0x00400300`) and value 1 (`0x00400410`) once the results
+request has succeeded, and `0x003f63b0` picks the player with the highest
+value 3. Value 0 is a level change. The 12 values are taken to be the
+ladder columns after `GLOBAL_RANK` and `ALIAS`. The nineteenth run is
+consistent with that: the kills appeared under the column with an operative
+icon (value 3, `KILLS`), and the column beside it (value 1, `RATING`) stayed
+at 0. The column order is: `LEVEL`, `RATING`, `FRAGSCORE`,
+`KILLS`, `DEATHS`, `RATIO`, `TEAMKILLS`, `ROUND`, `TEAMROUND`, `TEAMWIN`,
+`TEAMRATIO` and `TIMEPLAYED`. Operation 71 now sends per-match statistics
+in that order:
+
+- kills: the sum of fields 1–16;
+- deaths: field 17;
+- team kills: field 18;
+- frag score: kills minus team kills;
+- round: 1 in Survival and Sharpshooter;
+- team round: 1 in Team Survival;
+- team win: 1 for the only team with a player who did not die (Team
+  Survival has no respawn);
+- time played: field 19.
+
+The per-match `RATIO` and `TEAMRATIO` are 0. `LEVEL` and `RATING` were 0
+until the Elo ladder below was added. The mode comes from the operation 17 state
+stored with the match ID. The owner's game submits results on a fixed
+interval of about 15.3 seconds (runs 16–18), and the online scoreboard
+shows only server statistics. In the eighteenth run, Sharpshooter scores
+therefore lagged kills by up to that interval. Short Survival rounds get
+one update. The service answers each submission at once.
+**Pending:** store the final values for each match and feed the ladder
+tables, which still return zeros.
+
+## Latest News
+
+The two login notices (`0xde`, reader `0x00411f80`) are the game's "Latest
+News" items 1 and 2. Both were empty, so the twenty-second run showed only
+the numbers. R6 now has built-in text for both. `TUBISOFT_R6_NEWS_1` and
+`TUBISOFT_R6_NEWS_2` replace them (`deploy/compose.r6.yaml` passes them
+through). Each item must be printable ASCII and at most 512 characters,
+because the reader copies it into a 0x201-byte buffer. An unset item keeps
+the built-in text, and a single space blanks it. Other profiles use the same
+`TUBISOFT_<SLUG>_NEWS_1/_2` settings; GR2's default notices stay empty.
+
+## Ladders and the Tubisoft Elo rating
+
+Ubisoft's server computed `RATING` and `LEVEL`, and the game does not
+contain that formula. At the project owner's request, R6 now uses
+Tubisoft's own Elo rating (`src/ubisoft/games/r6_ladder.py`). It is not the
+original formula.
+
+Ranking queries: `0x00427770` stores the query's fourth value (`+0x30`),
+which is the ladder index. Sign-in asks for ladders 0–3, and for `LEVEL`
+on ladders 1–3. The column index table at `0x0058f4c0` lists `GLOBAL_RANK`,
+`ALIAS`, `LEVEL`, `RATING`, `FRAGSCORE`, `KILLS`, `DEATHS`, `RATIO`,
+`TEAMKILLS`, `ROUND`, `TEAMROUND`, `TEAMWIN`, `TEAMRATIO`, `TIMEPLAYED` and
+`COUNTRY_ID`. Native getters read `GLOBAL_RANK`, `LEVEL`, `RATING` and
+`COUNTRY_ID` as integers and `ALIAS` as a string. Ladders 1–3 are taken to
+be Survival, Team Survival and Sharpshooter, the order of the ladder names
+and of the operation 17 mode numbers. Ladder 0 combines all modes. This
+mapping still needs a retail check.
+
+Recording:
+
+- Every operation 30 keeps the match's latest results. The owner's
+  operation 45, at round end, records them.
+- A round that is abandoned (a new operation 17 with no operation 45) is
+  not recorded.
+- Each player with an account gets a row on the mode's ladder and on
+  ladder 0 (table `r6_ladder` in the account database). The row holds the
+  rating, the counters (frag score, kills, deaths, team kills, rounds, team
+  rounds, team wins and seconds) and the match count.
+- The room's members then get a final operation 71 carrying the rating
+  change (value 1) and the level change (value 0).
+- Earlier operation 71 messages carry the rating change so far, with no
+  level change, because the client adds value 0 to the level every time.
+
+Rating:
+
+- New players start at 1000, with K = 32.
+- Every pair of rated players in a match is one Elo game. The expected
+  score is 1 / (1 + 10^((opponent - player) / 400)).
+- A player's change is K × (sum of score − expected) ÷ the number of
+  opponents, rounded.
+- Sharpshooter compares frag scores (kills − team kills).
+- Survival ranks surviving first, then frag score.
+- Team Survival compares only players on opposite teams, using the round's
+  winning team. A round with no single winning team is a draw.
+- Players without an account are neither rated nor counted as opponents.
+- Level = (rating − 1000) ÷ 50, rounded down and clamped to 0–15.
+
+Queries:
+
+- Type 2 (named players) returns a row per alias. A player without a
+  finished match gets zeros, as before.
+- Type 3 `[start, count]` returns rows from a 0-based position.
+- Type 1 `[alias, count]` returns a window around the player.
+- Rows are ordered by rating, then kills. `GLOBAL_RANK` is the position.
+- `RATIO` is kills ÷ deaths and `TEAMRATIO` is team wins ÷ team rounds,
+  each ×100 and rounded down (1.5 is sent as 150). Every cell except
+  `ALIAS` must be a whole integer. Int getter `0x00427530` (`0x0043c650`,
+  `strtol`) throws `CLadderResults::NonNumericValue` otherwise, and My Rank
+  (`0x004849b0`) needs exactly one row and reads all 15 columns as
+  integers. In the twenty-first run, `"1.50"` left My Rank blank while Top
+  10 (which does not read `RATIO`) worked. `TIMEPLAYED` is in seconds.
+- `COUNTRY_ID` is the numeric ID of the player's stored profile country
+  (see Country), or 0 for none.
+- An empty result keeps the empty form that the sign-in stage accepts.
+- Every column is returned, with the requested ones first. In the
+  twentieth run, the My Rank screen (type 1 `[alias, 1]`, ladders 0–3) and
+  the ladder screens (type 3 `[0, 10]`) sent no column names. The service
+  had answered them with the empty form, which left My Rank blank and
+  showed no new results. After the first recorded match, the sign-in top
+  list (type 3 on ladder 0, requesting `ALIAS`, `GLOBAL_RANK` and `RATING`)
+  returned rows, and refreshing showed an error. Parser `0x00485410` reads
+  `GLOBAL_RANK`, `ALIAS`, `COUNTRY_ID` (`0x00486210`) and `RATING` from
+  every row and fails when a column is missing.
+- The log records each query's ladder, selection (names only by length),
+  columns and filters, so the browsing screens' requests can be checked.
+
+### Country IDs and the country filter
+
+The profile screen loads three parallel `P_country` lists into the online
+menu object: names at `+0x190`, codes at `+0x19c` and numeric IDs at
+`+0x1a8`. There are 240 entries. A save state from the twenty-sixth run
+gave the values: for example "NoLimit" `nll` 0, Canada `ca` 153, Germany
+`de` 35, United Kingdom `uk` 308 and United States `us` 309. France and two
+French territories share 189. Operation `0x62` stores the code
+(`0x005140e0`). Ladder rows carry the ID, which `0x00513eb0` maps back to a
+name (rank screens `0x00529460` and `0x005298e0`; an unknown ID shows the
+default). `r6_ladder.COUNTRY_IDS` holds the code-to-ID table, and
+`COUNTRY_ID` is filled from it.
+
+The ladder query handler `0x00518af0` adds a filter when a country other
+than "No Limit" is chosen. `0x00513fc0` turns the chosen name into its ID,
+and `0x004863f0` stores a 0x8c-byte record: `COUNTRY_ID` padded with NULs
+to 0x84 bytes, then two little-endian words, operator 0 and the ID.
+Serializer `0x004379d0` sends each record as a binary value in the query's
+third column list (columns, sort, filters). The service applies operator 0
+on `COUNTRY_ID` to the type 1 and type 3 selections and ignores other
+filters. `GLOBAL_RANK` stays the overall position, and the total is the
+number of matching rows. A filter value that is not a 0x8c-byte binary
+gets the empty form.
+
+## Leaving a room
+
+After a guest left a game in the sixteenth run, that game was missing from
+the guest's list until Search Game re-entered the parent lobby. The success
+callback for operation 8 (`0x00403880`, callback slot `+0x60`) handles a
+room ID (≤ 0) by clearing the current room (`+0x194`), freeing every game
+and member entry (`0x004051c0`), and then requesting the parent group again
+with operation 9 (`0x0040b470` -> `0x004197e0`). The operation 9 reply
+listed the game again, but its owner was no longer a known member, so match
+list filler `0x004e1ea0` hid it. The service now follows the operation 9
+listing with the announced members' records (operation 50), as it does
+after operation 23. `0x00401880` skips a member already filed under the
+same group, so a repeated record is not counted twice.
 
 ## Launcher hosting path (XIII-like)
 

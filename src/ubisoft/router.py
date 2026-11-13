@@ -19,6 +19,7 @@ from . import accounts, crypto, data, gsxor, nat, proxy, rooms, srp_probe
 from .bootstrap import port_number
 from .frame import GSHeader, HEADER_SIZE, read_frame
 from .games.base import GameProfile
+from .games.r6_ladder import ranking_filters
 from .games.xiii import PROFILE as XIII
 from .access import AccessPolicy
 
@@ -36,6 +37,22 @@ def response_header(request: GSHeader, payload: bytes, message_type: int | None 
 def make_frame(request: GSHeader, fields: list) -> bytes:
     payload = gsxor.encrypt(data.encode(fields))
     return response_header(request, payload) + payload
+
+
+def value_shape(value, depth: int = 0, limit: int = 16) -> str:
+    # Structure of a GS value for logs: decimal strings are shown, other
+    # strings and binary values only by length, so names never appear.
+    if isinstance(value, list):
+        if depth >= 4:
+            return f"list{len(value)}"
+        items = ",".join(value_shape(item, depth + 1, limit) for item in value[:limit])
+        return f"[{items}{',...' if len(value) > limit else ''}]"
+    if isinstance(value, bytes):
+        return f"bin{len(value)}"
+    text = value[1:] if value.startswith("-") else value
+    if text.isascii() and text.isdigit() and len(text) <= 10:
+        return value
+    return f"str{len(value)}"
 
 
 def room_number(text: object) -> int | None:
@@ -90,6 +107,74 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
     host_member_notified = False
     closed_room_id: int | None = None
 
+    def wait_push(message_type: int, fields: list) -> None:
+        # Unsolicited wait-module message (server 1 -> client 4).
+        payload = gsxor.encrypt(data.encode(fields))
+        try:
+            writer.write(GSHeader(HEADER_SIZE + len(payload), 0, 1, message_type, 1, 4).encode() + payload)
+        except (ConnectionError, OSError):
+            LOG.info("friends notification skipped peer=%s: connection already closed", peer)
+
+    def release_friend_channel() -> None:
+        if wait_user is not None:
+            channel = registry.friend_channels.get(wait_user.casefold())
+            if channel is not None and channel[0] is host_connection:
+                del registry.friend_channels[wait_user.casefold()]
+                registry.friend_lists.pop(wait_user.casefold(), None)
+                notify_presence(wait_user)
+
+    def message_time() -> str:
+        # 0x003fef10 parses fixed fields: year-1900 (3 digits), month-1,
+        # day, hour, minute and second (2 digits each); 0x005146c0 shows
+        # them as "Y-M-D h:mm GMT".
+        now = time.gmtime()
+        return (f"{now.tm_year - 1900:03d}{now.tm_mon - 1:02d}{now.tm_mday:02d}"
+                f"{now.tm_hour:02d}{now.tm_min:02d}{now.tm_sec:02d}")
+
+    def presence(name: str) -> tuple[int, str]:
+        # Friends UI 0x004e0700: 0 online, 1 offline, 9 in game (with the
+        # product, compared by 0x003ff1c0).
+        for member in registry.lobby_members(game_profile.product):
+            if member.name.casefold() == name.casefold():
+                return (0, "") if member.group == "1" else (9, game_profile.product)
+        if name.casefold() in registry.friend_channels:
+            # Signed in to the friends service but not in the game lobby.
+            return 0, ""
+        return 1, ""
+
+    def notify_presence(name: str) -> None:
+        # 0x003fd0d0 drops an entry with the same name before inserting, so a
+        # new 0x4a record updates a watcher's list in place.
+        if not game_profile.lobby_members:
+            return
+        key = name.casefold()
+        sent = 0
+        for watcher, friends in list(registry.friend_lists.items()):
+            entry = friends.get(key)
+            channel = registry.friend_channels.get(watcher)
+            if entry is None or channel is None:
+                continue
+            channel[1](0x4a, friend_record(*entry))
+            sent += 1
+        if sent:
+            LOG.info("friend presence update game=%s peer=%s status=%d watchers=%d",
+                     game_profile.slug, peer, presence(name)[0], sent)
+
+    def friend_record(name: str, group: str) -> list:
+        # Pushed 0x4a (reader 0x00413bb0 -> 0x003fdd90): name, u32 status,
+        # group, two u32 values and a product string.
+        status, product = presence(name)
+        return [name, status.to_bytes(4, "little"), group, bytes(4), bytes(4), product]
+
+    def parent_record(joining: bool = False) -> list:
+        # Titles with a member directory report the players in the lobby.
+        if not game_profile.lobby_members:
+            return game_profile.parent_lobby()
+        players = len(registry.lobby_members(game_profile.product))
+        if joining and registry.lobby_member(host_connection) is None:
+            players += 1
+        return game_profile.parent_lobby(players)
+
     def lobby_send(event: list) -> None:
         payload = gsxor.encrypt(data.encode(event))
         try:
@@ -108,6 +193,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
             other.send(event)
         LOG.info("lobby member announced game=%s peer=%s group=%s info_bytes=%d recipients=%d",
                  game_profile.slug, peer, member.group, len(member.info), len(others))
+        notify_presence(member.name)
 
     def lobby_set_group(group: str) -> None:
         member = registry.lobby_member(host_connection)
@@ -132,6 +218,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
             other.send(event)
         LOG.info("lobby member departure sent game=%s peer=%s group=%s recipients=%d",
                  game_profile.slug, peer, member.group, len(others))
+        notify_presence(member.name)
 
     def room_removed(room: rooms.Room) -> None:
         nonlocal joined_room, join_endpoint_sent, host_member_notified, closed_room_id
@@ -159,6 +246,24 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
             LOG.info("room-closed notification skipped peer=%s: connection already closed", peer)
         if game_profile.lobby_members:
             lobby_set_group("1")
+
+    async def record_match(ladder, room: rooms.Room) -> None:
+        # The owner's end-of-round report finishes the room's current match:
+        # its latest results update the ladder, and the room's members get
+        # the final statistics with the rating and level changes.
+        match_id = registry.room_matches.pop(room.room_id, None)
+        pending = registry.match_results.pop(match_id, None) if match_id else None
+        if pending is None or pending[0] != room.room_id:
+            return
+        mode = registry.match_modes.get(match_id)
+        changes = await asyncio.to_thread(ladder.record, pending[1], mode)
+        event = game_profile.match_results_event(match_id, pending[1], mode, changes)
+        in_room = [member for member in registry.lobby_members(game_profile.product)
+                   if member.group == str(room.room_id)]
+        for member in in_room:
+            member.send(event)
+        LOG.info("match recorded game=%s peer=%s room=%d match=%s mode=%s rated=%d recipients=%d",
+                 game_profile.slug, peer, room.room_id, match_id, mode, len(changes), len(in_room))
 
     registry.add_remove_listener(room_removed)
     async def account_operation(operation, *arguments):
@@ -263,6 +368,24 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                         LOG.info("launcher credentials accepted peer=%s", peer)
                         continue
                     LOG.info("launcher credentials rejected peer=%s", peer)
+                elif (header.message_type == 0x62 and wait_user is not None
+                      and game_profile.lobby_members and len(fields) == 6
+                      and all(isinstance(field, str) for field in fields)):
+                    # Personal-info update (sender 0x00410750, called from
+                    # menu handler 0x00518af0 via 0x00406f40): an empty
+                    # string and five profile strings. The fifth is the
+                    # country code that 0x005140e0 looks up from the chosen
+                    # "P_country" name; player info returns it as field 4. Reader 0x00411ea0 only needs the
+                    # result. Only the country is stored (accounts
+                    # `countries`); the other fields may be personal and are
+                    # neither stored nor logged.
+                    stored = await account_operation(accounts.set_country, account_db, wait_user, fields[5])
+                    payload = gsxor.encrypt(data.encode([b"\x62"]))
+                    writer.write(response_header(header, payload, 0x26) + payload)
+                    await writer.drain()
+                    LOG.info("profile update acknowledged game=%s peer=%s country_stored=%s field_bytes=%s",
+                             game_profile.slug, peer, stored, [len(field.encode()) for field in fields])
+                    continue
             else:
                 proxy_route = (header.sender, header.receiver) == (8, 11) and bool(game_profile.proxy_services)
                 if (proxy_route and header.property == 0 and header.message_type == 0x5d
@@ -284,6 +407,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                     # Friends-disconnect is separate from router logout.
                     # 0x01d6cbd0 sends an empty message without awaiting a result.
                     friends_logged_in = False
+                    release_friend_channel()
                     LOG.info("friends channel disconnected peer=%s; sign-in session retained", peer)
                     continue
                 if (header.property == 0 and header.message_type == 0x54
@@ -294,6 +418,18 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                     # ID. With no stored ignore entries, no item events follow.
                     payload = gsxor.encrypt(data.encode([b"\x54"]))
                     writer.write(response_header(header, payload, 0x26) + payload)
+                    if game_profile.lobby_members:
+                        # R6 (reader 0x004157f0 -> callback 0x003fd680)
+                        # completes the request, then each pushed 0x55
+                        # [name] (reader 0x004156b0 -> 0x003fd4f0) adds one
+                        # entry to the ignore list (friends object +0x3c).
+                        listed = await account_operation(accounts.ignored, account_db, wait_user)
+                        for name in listed:
+                            payload = gsxor.encrypt(data.encode([name]))
+                            writer.write(response_header(header, payload, 0x55) + payload)
+                        await writer.drain()
+                        LOG.info("ignore list sent game=%s peer=%s entries=%d", game_profile.slug, peer, len(listed))
+                        continue
                     await writer.drain()
                     LOG.info("empty ignore list completed game=%s peer=%s", game_profile.slug, peer)
                     continue
@@ -368,11 +504,32 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                      fields[0][0] if isinstance(fields[0], list) else fields[0])
                             continue
                         if proxy_route and header.message_type == 0xcc and proxy_ready:
-                            reply = proxy.query_reply(game_profile, fields, proxy_user, ranking_store=ranking_store)
+                            reply = proxy.query_reply(game_profile, fields, proxy_user, ranking_store=ranking_store,
+                                                      account_db=account_db)
                             writer.write(make_frame(header, reply))
                             await writer.drain()
-                            LOG.info("ranking result game=%s peer=%s operation=%s request=%s",
-                                     game_profile.slug, peer, fields[0], fields[1])
+                            query = fields[2][1] if (len(fields[2]) == 2 and isinstance(fields[2][1], list)
+                                                     and len(fields[2][1]) == 6) else None
+                            if query is not None and isinstance(query[4], list) and isinstance(query[5], list):
+                                # Ladder, selection (aliases only by length)
+                                # and requested column names.
+                                columns = [c for c in (query[5][0] if query[5] and isinstance(query[5][0], list) else [])
+                                           if isinstance(c, str) and len(c) <= 32 and c.replace("_", "").isalnum()]
+                                # Filters: field name, operator and a
+                                # numeric value (a country ID), or the shape.
+                                try:
+                                    filters = [(name[:32], operator, value) for name, operator, value
+                                               in ranking_filters(query[5][2] if len(query[5]) > 2 else [])]
+                                except ValueError:
+                                    filters = value_shape(query[5][2])
+                                LOG.info("ranking result game=%s peer=%s operation=%s request=%s ladder=%s "
+                                         "selection=%s columns=%s filters=%s rows=%d", game_profile.slug, peer,
+                                         fields[0], fields[1], value_shape(query[3]), value_shape(query[4]), columns,
+                                         filters,
+                                         len(reply[2][1][1][3]) if len(reply[2][1]) == 2 and len(reply[2][1][1]) == 4 else -1)
+                            else:
+                                LOG.info("ranking result game=%s peer=%s operation=%s request=%s",
+                                         game_profile.slug, peer, fields[0], fields[1])
                             continue
                         if (header.message_type == 0xd9 and local[1] != wait_port
                                 and logged_in_user is not None and len(fields) == 2
@@ -459,10 +616,49 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                               and len(fields) == 1 and isinstance(fields[0], str)
                               and fields[0].casefold() == wait_user.casefold()):
                             profile = [wait_user, wait_user, "", "", "", "", ""]
+                            if game_profile.lobby_members:
+                                # Reader 0x004110a0 -> callback 0x004068e0 ->
+                                # 0x00407350 files the seven fields at player
+                                # object +0x228: field 0 -> +0x114 (10 bytes),
+                                # 1 -> +0x0 (alias, 16), 2 -> +0x10 (33),
+                                # 3 -> +0x31 (33), 4 -> +0x52 (65), 5 -> +0x93
+                                # (129), 6 -> +0x11e (129); confirmed from a
+                                # retail save state. Personal Settings
+                                # (0x00542e40) shows +0x52, field 4, as the
+                                # country (0x00514250 maps the code back to
+                                # the "P_country" name).
+                                profile[4] = await account_operation(accounts.country, account_db, wait_user)
                             payload = gsxor.encrypt(data.encode([b"\x13", profile]))
                             writer.write(response_header(header, payload, 0x26) + payload)
                             await writer.drain()
-                            LOG.info("player info sent peer=%s", peer)
+                            LOG.info("player info sent peer=%s field_bytes=%s", peer,
+                                     [len(field.encode()) for field in profile])
+                            continue
+                        elif (header.message_type == 0x08 and wait_user is not None
+                              and game_profile.lobby_members and len(fields) == 7
+                              and all(isinstance(value, str) for value in fields)):
+                            # Player search (sender 0x00412c50: five strings,
+                            # a "0"/"1"/"2" character and a string). Reader
+                            # 0x00413d80 takes one result per 0x26 reply,
+                            # [name, u32 status, product]; callback 0x003fd3d0
+                            # keeps up to 20 and treats 0x27 with code 0x30 as
+                            # the end of the results. Status (UI 0x004e0700):
+                            # 0 online, 1 offline, 9 in game.
+                            names = await account_operation(accounts.search_accounts, account_db, fields[0])
+                            sent = 0
+                            for name in names:
+                                if name.casefold() == wait_user.casefold():
+                                    continue
+                                status, product = presence(name)
+                                result = [name, status.to_bytes(4, "little"), product]
+                                payload = gsxor.encrypt(data.encode([b"\x08", result]))
+                                writer.write(response_header(header, payload, 0x26) + payload)
+                                sent += 1
+                            payload = gsxor.encrypt(data.encode([b"\x08", [(0x30).to_bytes(4, "little")]]))
+                            writer.write(response_header(header, payload, 0x27) + payload)
+                            await writer.drain()
+                            LOG.info("player search answered game=%s peer=%s results=%d",
+                                     game_profile.slug, peer, sent)
                             continue
                         elif (header.message_type == 0x13 and wait_user is not None
                               and game_profile.lobby_members and len(fields) == 1
@@ -473,11 +669,17 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                             # or 0x27 with a four-byte error code.
                             known = [member.name for member in registry.lobby_members(game_profile.product)
                                      if fields[0] and member.name.casefold() == fields[0].casefold()]
+                            if not known and fields[0]:
+                                # Search results and friends need not be online.
+                                found = await account_operation(accounts.find_account, account_db, fields[0])
+                                known = [found] if found else []
                             if known:
-                                profile = [known[0], known[0], "", "", "", "", ""]
+                                profile = [known[0], known[0], "", "",
+                                           await account_operation(accounts.country, account_db, known[0]), "", ""]
                                 payload = gsxor.encrypt(data.encode([b"\x13", profile]))
                                 writer.write(response_header(header, payload, 0x26) + payload)
-                                LOG.info("member player info sent game=%s peer=%s", game_profile.slug, peer)
+                                LOG.info("member player info sent game=%s peer=%s field_bytes=%s", game_profile.slug,
+                                         peer, [len(field.encode()) for field in profile])
                             else:
                                 payload = gsxor.encrypt(data.encode([b"\x13", [bytes(4)]]))
                                 writer.write(response_header(header, payload, 0x27) + payload)
@@ -490,11 +692,134 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                               and all(isinstance(field, bytes) and len(field) == 4 for field in fields)):
                             # The shared presence channel supports login and an
                             # empty ignore list; other operations remain explicit.
+                            if game_profile.lobby_members:
+                                # Registered before the reply so a message sent
+                                # right after this login is deliverable.
+                                registry.friend_channels[wait_user.casefold()] = (host_connection, wait_push)
                             payload = gsxor.encrypt(data.encode([b"\x4e"]))
                             writer.write(response_header(header, payload, 0x26) + payload)
+                            if game_profile.lobby_members:
+                                listed = await account_operation(accounts.friends, account_db, wait_user)
+                                for name, group in listed:
+                                    payload = gsxor.encrypt(data.encode(friend_record(name, group)))
+                                    writer.write(response_header(header, payload, 0x4a) + payload)
+                                registry.friend_lists[wait_user.casefold()] = {
+                                    name.casefold(): (name, group) for name, group in listed}
+                                LOG.info("friends list sent game=%s peer=%s friends=%d",
+                                         game_profile.slug, peer, len(listed))
+                                notify_presence(wait_user)
                             await writer.drain()
                             friends_logged_in = True
                             LOG.info("experimental friends login accepted peer=%s", peer)
+                            continue
+                        elif (header.message_type == 0x4b and wait_user is not None and friends_logged_in
+                              and game_profile.lobby_members and len(fields) == 3
+                              and isinstance(fields[0], str) and isinstance(fields[1], str)
+                              and isinstance(fields[2], bytes) and len(fields[2]) == 4):
+                            # Add friend (sender 0x004127a0: name, group, u32).
+                            # Reader 0x00412ea0 reads [0x4b, name] from 0x26;
+                            # callback 0x003fdc70 only records the result. The
+                            # list entry comes from a pushed 0x4a record.
+                            added = await account_operation(accounts.add_friend, account_db,
+                                                            wait_user, fields[0], fields[1])
+                            if added is None:
+                                payload = gsxor.encrypt(data.encode([b"\x4b", [bytes(4)]]))
+                                writer.write(response_header(header, payload, 0x27) + payload)
+                            else:
+                                payload = gsxor.encrypt(data.encode([b"\x4b", added]))
+                                writer.write(response_header(header, payload, 0x26) + payload)
+                                registry.friend_lists.setdefault(wait_user.casefold(), {})[
+                                    added.casefold()] = (added, fields[1])
+                                payload = gsxor.encrypt(data.encode(friend_record(added, fields[1])))
+                                writer.write(response_header(header, payload, 0x4a) + payload)
+                            await writer.drain()
+                            LOG.info("friend add game=%s peer=%s added=%s", game_profile.slug, peer, added is not None)
+                            continue
+                        elif (header.message_type == 0x58 and wait_user is not None and friends_logged_in
+                              and game_profile.lobby_members and len(fields) == 2
+                              and isinstance(fields[0], list) and 0 < len(fields[0]) <= 20
+                              and all(isinstance(name, str) for name in fields[0])
+                              and isinstance(fields[1], str)):
+                            # Message (sender 0x00412a40: [recipients], text).
+                            # Reader 0x00413170: 0x26 [0x58, name] or 0x27
+                            # [0x58, [code, name]]. 0x00466e10 requires the
+                            # success value to be a string (node type 1), not
+                            # a list; otherwise the callback never runs. Recipients get a pushed
+                            # 0x65 [from, text, time] (reader 0x00413040 ->
+                            # 0x003fca90; inbox of 10, text buffer 0x100).
+                            text = fields[1].encode()[:255].decode(errors="ignore")
+                            undelivered = None
+                            withheld = 0
+                            for name in fields[0]:
+                                channel = registry.friend_channels.get(name.casefold())
+                                if channel is None:
+                                    undelivered = undelivered or name
+                                    continue
+                                if wait_user.casefold() in await account_operation(
+                                        accounts.ignoring, account_db, name, [wait_user]):
+                                    # The recipient ignores the sender: the
+                                    # message is dropped without telling them.
+                                    withheld += 1
+                                    continue
+                                channel[1](0x65, [wait_user, text, message_time()])
+                            if undelivered is None:
+                                payload = gsxor.encrypt(data.encode([b"\x58", fields[0][0]]))
+                                writer.write(response_header(header, payload, 0x26) + payload)
+                            else:
+                                payload = gsxor.encrypt(data.encode([b"\x58", [bytes(4), undelivered]]))
+                                writer.write(response_header(header, payload, 0x27) + payload)
+                            await writer.drain()
+                            LOG.info("friend message game=%s peer=%s recipients=%d delivered=%s withheld=%d",
+                                     game_profile.slug, peer, len(fields[0]), undelivered is None, withheld)
+                            continue
+                        elif (header.message_type in (0x4f, 0x50) and wait_user is not None and friends_logged_in
+                              and game_profile.lobby_members and len(fields) == 1
+                              and isinstance(fields[0], str)):
+                            # Ignore (0x4f, sender 0x00414880) and unignore
+                            # (0x50, sender 0x004149e0) a player by name.
+                            # Readers 0x00414c60 / 0x00415140 take element 1
+                            # as a list: success 0x26 [op, [name]], failure
+                            # 0x27 [op, [code, [name]]]. Callbacks 0x003fd8b0
+                            # / 0x003fd700 add or remove the entry themselves
+                            # and complete the request state (+0x80 / +0x88).
+                            if header.message_type == 0x4f:
+                                name = await account_operation(accounts.add_ignored, account_db,
+                                                               wait_user, fields[0])
+                                done = name is not None
+                            else:
+                                done = await account_operation(accounts.remove_ignored, account_db,
+                                                               wait_user, fields[0])
+                                name = fields[0]
+                            op = bytes([header.message_type])
+                            if done:
+                                payload = gsxor.encrypt(data.encode([op, [name]]))
+                                writer.write(response_header(header, payload, 0x26) + payload)
+                            else:
+                                payload = gsxor.encrypt(data.encode([op, [bytes(4), [fields[0]]]]))
+                                writer.write(response_header(header, payload, 0x27) + payload)
+                            await writer.drain()
+                            LOG.info("ignore %s game=%s peer=%s done=%s",
+                                     "add" if header.message_type == 0x4f else "remove",
+                                     game_profile.slug, peer, done)
+                            continue
+                        elif (header.message_type == 0x4c and wait_user is not None and friends_logged_in
+                              and game_profile.lobby_members and len(fields) == 1
+                              and isinstance(fields[0], str)):
+                            # Remove friend (sender 0x00412900: name). Reader
+                            # 0x00412f70 reads [0x4c, name]; callback
+                            # 0x003fdbe0 removes that entry (0x003fcf50).
+                            removed = await account_operation(accounts.remove_friend, account_db,
+                                                              wait_user, fields[0])
+                            if removed:
+                                registry.friend_lists.get(wait_user.casefold(), {}).pop(
+                                    fields[0].casefold(), None)
+                                payload = gsxor.encrypt(data.encode([b"\x4c", fields[0]]))
+                                writer.write(response_header(header, payload, 0x26) + payload)
+                            else:
+                                payload = gsxor.encrypt(data.encode([b"\x4c", [bytes(4)]]))
+                                writer.write(response_header(header, payload, 0x27) + payload)
+                            await writer.drain()
+                            LOG.info("friend remove game=%s peer=%s removed=%s", game_profile.slug, peer, removed)
                             continue
                         elif (header.message_type == 0xd1 and wait_user is not None
                               and len(fields) == 2 and isinstance(fields[0], str)
@@ -515,7 +840,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                 payload = gsxor.encrypt(data.encode(["38", ["21"]]))
                                 writer.write(response_header(header, payload, 0xd1) + payload)
                                 # The title adapter supplies its tested parent record.
-                                payload = gsxor.encrypt(data.encode(["53", ["1", "256", ["0"], [game_profile.parent_lobby()]]]))
+                                payload = gsxor.encrypt(data.encode(["53", ["1", "256", ["0"], [parent_record()]]]))
                                 writer.write(response_header(header, payload, 0xd1) + payload)
                                 await writer.drain()
                                 LOG.info("discovery login response and experimental parent lobby sent peer=%s", peer)
@@ -533,8 +858,21 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                 # Group-info notification with the actual local parent
                                 # and no child game rooms; the prior subtype-9 reply
                                 # caused XIII to report that the group did not exist.
-                                payload = gsxor.encrypt(data.encode(["53", ["1", "256", game_profile.parent_lobby(), registry.children(game_profile.product)]]))
+                                payload = gsxor.encrypt(data.encode(["53", ["1", "256", parent_record(), registry.children(game_profile.product)]]))
                                 writer.write(response_header(header, payload, 0xd1) + payload)
+                                if game_profile.lobby_members:
+                                    # R6 sends this after leaving a room. The
+                                    # leave callback (0x00403880 -> 0x004051c0)
+                                    # first clears the client's game and member
+                                    # lists, so a hosted game stays hidden until
+                                    # its owner is filed again. 0x00401880 skips
+                                    # members that are already known.
+                                    known = [member for member in registry.lobby_members(
+                                        game_profile.product, exclude=host_connection) if member.announced]
+                                    for member in known:
+                                        lobby_send(game_profile.lobby_member_event(member))
+                                    LOG.info("lobby members resent game=%s peer=%s members=%d",
+                                             game_profile.slug, peer, len(known))
                                 await writer.drain()
                                 LOG.info("lobby group sent peer=%s active_rooms=%d", peer, len(registry.children(game_profile.product)))
                                 continue
@@ -551,7 +889,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                 # not registration of a synthetic game room.
                                 children = registry.children(game_profile.product)
                                 payload = gsxor.encrypt(data.encode(["53", [
-                                    "1", "256", game_profile.parent_lobby(), children]]))
+                                    "1", "256", parent_record(joining=True), children]]))
                                 writer.write(response_header(header, payload, 0xd1) + payload)
                                 if game_profile.lobby_members:
                                     # Hosted games are listed only when their
@@ -602,7 +940,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                     # List the new game for the other parent
                                     # members before announcing its owner, so
                                     # 0x004034a0 can count the owner in it.
-                                    listing = ["53", ["1", "256", game_profile.parent_lobby(), [created.group_fields()]]]
+                                    listing = ["53", ["1", "256", parent_record(), [created.group_fields()]]]
                                     for other in registry.lobby_members(game_profile.product, exclude=host_connection):
                                         other.send(listing)
                                     lobby_set_group(str(created.room_id))
@@ -613,18 +951,82 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
                                          created.max_spectators, created.flags, len(created.info),
                                          len(created.additional_info), created.game_version[:16], created.sdk_version[:16])
                                 continue
+                            if (game_profile.lobby_members and subtype == 30 and fields[1]
+                                    and isinstance(fields[1][0], str) and room_number(fields[1][0]) is not None):
+                                # Match results (0x00401070 -> sender 0x00418ec0):
+                                # [match ID (+0x20, from operation 62), 0, one
+                                # entry per player]; the owner sends it about
+                                # every 15 seconds during a round. Entry
+                                # (0x00457370): name, highest field ID, field
+                                # count, field-ID bit mask, values by field ID
+                                # (set by 0x00457280). Reader 0x0041e8c0 only
+                                # reads the first value back. The room's
+                                # members get the values as operation 71.
+                                # Results are not stored yet; the log records
+                                # the values (names only by length).
+                                current = host_room or joined_room
+                                mode = registry.match_modes.get(fields[1][0])
+                                ladder = game_profile.match_ladder(account_db)
+                                changes = {}
+                                if ladder is not None and current is not None:
+                                    # Rating changes so far; the ladder is
+                                    # updated when the round ends (operation 45).
+                                    changes = await asyncio.to_thread(ladder.provisional, fields[1][2:], mode)
+                                    registry.match_results[fields[1][0]] = (current.room_id, fields[1][2:])
+                                    while len(registry.match_results) > 256:
+                                        del registry.match_results[next(iter(registry.match_results))]
+                                event = game_profile.match_results_event(fields[1][0], fields[1][2:], mode, changes)
+                                payload = gsxor.encrypt(data.encode(["38", ["30", [fields[1][0]]]]))
+                                writer.write(response_header(header, payload, 0xd1) + payload)
+                                in_room = []
+                                if current is not None:
+                                    in_room = [member for member in registry.lobby_members(game_profile.product)
+                                               if member.group == str(current.room_id)]
+                                    for member in in_room:
+                                        member.send(event)
+                                await writer.drain()
+                                LOG.info("match results received game=%s peer=%s match=%s room=%s recipients=%d shape=%s",
+                                         game_profile.slug, peer, fields[1][0],
+                                         current.room_id if current is not None else None,
+                                         len(in_room), value_shape(fields[1][1:], limit=64))
+                                continue
                             if (game_profile.lobby_create and host_room is not None
                                     and subtype in (15, 17, 30, 31, 33)):
                                 reply = game_profile.room_update(host_room, subtype, fields[1])
                                 payload = gsxor.encrypt(data.encode(["38", [str(subtype), reply]]))
                                 writer.write(response_header(header, payload, 0xd1) + payload)
-                                await writer.drain()
                                 LOG.info("room update accepted game=%s peer=%s room=%d subtype=%d game_port=%s",
                                          game_profile.slug, peer, host_room.room_id, subtype, host_room.game_port)
+                                if game_profile.lobby_members and subtype == 17:
+                                    # A new round drops the unfinished one's results.
+                                    previous = registry.room_matches.pop(host_room.room_id, None)
+                                    registry.match_results.pop(previous, None)
+                                    match_id = registry.next_match_id(fields[1][1])
+                                    registry.room_matches[host_room.room_id] = str(match_id)
+                                    event = game_profile.match_started_event(host_room, match_id)
+                                    in_room = [member for member in registry.lobby_members(game_profile.product)
+                                               if member.group == str(host_room.room_id)]
+                                    for member in in_room:
+                                        member.send(event)
+                                    LOG.info("match start sent game=%s peer=%s room=%d match=%d state=%s recipients=%d",
+                                             game_profile.slug, peer, host_room.room_id, match_id,
+                                             value_shape(fields[1][1]), len(in_room))
+                                await writer.drain()
                                 continue
                             if game_profile.lobby_create and subtype in game_profile.room_notice_subtypes:
                                 if joined_room is not None and registry.active_room(joined_room.room_id, game_profile.product) is joined_room:
                                     game_profile.room_notice(joined_room, subtype, fields[1])
+                                    notice_reply = game_profile.room_notice_reply(joined_room, subtype)
+                                    if notice_reply is not None:
+                                        payload = gsxor.encrypt(data.encode(notice_reply))
+                                        writer.write(response_header(header, payload, 0xd1) + payload)
+                                        await writer.drain()
+                                        LOG.info("room report completed game=%s peer=%s room=%d subtype=%d",
+                                                 game_profile.slug, peer, joined_room.room_id, subtype)
+                                        ladder = game_profile.match_ladder(account_db)
+                                        if subtype == 45 and ladder is not None and host_room is joined_room:
+                                            await record_match(ladder, joined_room)
+                                        continue
                                     LOG.info("room report accepted game=%s peer=%s room=%d subtype=%d; no completion",
                                              game_profile.slug, peer, joined_room.room_id, subtype)
                                     continue
@@ -813,6 +1215,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
         LOG.info("closed peer=%s reason=%s", peer, type(exc).__name__)
     finally:
         registry.remove_remove_listener(room_removed)
+        release_friend_channel()
         if game_profile.lobby_members:
             lobby_depart()
         if joined_room is not None and wait_user is not None:

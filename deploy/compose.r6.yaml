@@ -9,6 +9,10 @@ services:
       TUBISOFT_R6_ROUTER_PORT: ${TUBISOFT_R6_ROUTER_PORT:-30020}
       TUBISOFT_R6_LAUNCHER_PORT: ${TUBISOFT_R6_LAUNCHER_PORT:-30021}
       TUBISOFT_R6_NAT_PORT: ${TUBISOFT_R6_NAT_PORT:-30022}
+      # "Latest News" items 1 and 2 (printable ASCII, up to 512 characters).
+      # Empty keeps the built-in text; a single space blanks an item.
+      TUBISOFT_R6_NEWS_1: ${TUBISOFT_R6_NEWS_1:-}
+      TUBISOFT_R6_NEWS_2: ${TUBISOFT_R6_NEWS_2:-}
     ports:
       - "${TUBISOFT_R6_ROUTER_PORT:-30020}:${TUBISOFT_R6_ROUTER_PORT:-30020}/tcp"
       - "${TUBISOFT_R6_ROUTER_PORT:-30020}:${TUBISOFT_R6_ROUTER_PORT:-30020}/udp"
