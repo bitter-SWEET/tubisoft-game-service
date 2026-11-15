@@ -95,7 +95,11 @@ docker compose -f compose.yaml -f deploy/compose.gr2.yaml --env-file .env up -d 
 curl --noproxy '*' 'http://127.0.0.1:18080/gsinit.php?dp=GHOSTRECON2PS2'
 ```
 
-Use the same Compose project and state volume. This is an overlay on the existing
+Rainbow Six 3 needs no overlay: `compose.yaml` already passes its settings
+and publishes ports 30020-30022, so `TUBISOFT_GAMES=xiii,r6` in `.env` is
+enough. The ports answer only when `r6` is enabled.
+
+Use the same Compose project and state volume. The GR2 file is an overlay on the existing
 service, not a second container/database. The common DNS/HTTP routing remains
 `gsconnect.ubisoft.com` on port 80. Keep using the existing platform DNS/DNAS.
 The optional PHP bridge forwards product requests to the canonical Python

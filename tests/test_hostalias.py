@@ -39,11 +39,20 @@ class HostAliasTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             service.configuration({"TUBISOFT_ADVERTISE_IP": "198.51.100.10", "TUBISOFT_HOST_ALIAS": "bad"})
 
-    def test_compose_forwards_the_setting(self):
+    def test_compose_forwards_the_setting_and_it_is_off_by_default(self):
         # Compose reads .env only for interpolation; the service environment
-        # must name the variable for it to reach the container.
+        # must name the variable for it to reach the container. Deployments
+        # leave it off; test setups opt in through .env.
         compose = (Path(__file__).resolve().parents[1] / "compose.yaml").read_text()
-        self.assertIn("TUBISOFT_HOST_ALIAS: ${TUBISOFT_HOST_ALIAS:-auto}", compose)
+        self.assertIn("TUBISOFT_HOST_ALIAS: ${TUBISOFT_HOST_ALIAS:-off}", compose)
+        self.assertIsNone(service.configuration({"TUBISOFT_ADVERTISE_IP": "198.51.100.10"}).host_alias)
+
+    def test_compose_serves_rainbow_six_3_without_an_overlay(self):
+        compose = (Path(__file__).resolve().parents[1] / "compose.yaml").read_text()
+        for name, port in (("ROUTER", 30020), ("LAUNCHER", 30021), ("NAT", 30022)):
+            self.assertIn(f"TUBISOFT_R6_{name}_PORT: ${{TUBISOFT_R6_{name}_PORT:-{port}}}", compose)
+        self.assertIn("TUBISOFT_GAMES: ${TUBISOFT_GAMES:-xiii}", compose)
+        self.assertIn("TUBISOFT_R6_NEWS_1: ${TUBISOFT_R6_NEWS_1:-}", compose)
 
     def test_nat_reports_the_alias_but_replies_to_the_real_source(self):
         discovery = nat.Discovery("0.0.0.0/0", host_alias=hostalias.HostAlias("203.0.113.1", "198.51.100.10"))

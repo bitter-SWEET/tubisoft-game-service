@@ -233,8 +233,11 @@ emulated `192.0.2.100`. Neither is reachable from another PC, so the entry
 was never shown.
 
 `ubisoft.hostalias` now reports clients that arrive from the container's
-default gateway at `TUBISOFT_ADVERTISE_IP` (`TUBISOFT_HOST_ALIAS=auto`,
-active only inside a container). Router rooms, handoffs, NAT replies and the
+default gateway at `TUBISOFT_ADVERTISE_IP` when `TUBISOFT_HOST_ALIAS=auto` is
+set (active only inside a container). It is off by default and meant for
+test setups with a game client on the server machine. Where Docker's
+userland proxy forwards remote traffic, remote clients also arrive from the
+gateway and would all be misreported, so a deployed server leaves it off. Router rooms, handoffs, NAT replies and the
 XIII UDP host login use the reported address; replies still go to the real
 source. The R6 profile also ignores the emulated `192.0.2.0/24` local address.
 
@@ -643,8 +646,7 @@ tables, which still return zeros.
 The two login notices (`0xde`, reader `0x00411f80`) are the game's "Latest
 News" items 1 and 2. Both were empty, so the twenty-second run showed only
 the numbers. R6 now has built-in text for both. `TUBISOFT_R6_NEWS_1` and
-`TUBISOFT_R6_NEWS_2` replace them (`deploy/compose.r6.yaml` passes them
-through). Each item must be printable ASCII and at most 512 characters,
+`TUBISOFT_R6_NEWS_2` replace them (`compose.yaml` passes them through). Each item must be printable ASCII and at most 512 characters,
 because the reader copies it into a 0x201-byte buffer. An unset item keeps
 the built-in text, and a single space blanks it. Other profiles use the same
 `TUBISOFT_<SLUG>_NEWS_1/_2` settings; GR2's default notices stay empty.
@@ -828,9 +830,12 @@ country settings work too. Remaining limitations: tests used two players on
 PCSX2; the DEDICATE stages are untraced; the lobby player count is not pushed
 live; and ratings use Tubisoft's own Elo formula, not Ubisoft's.
 
+R6 needs no Compose overlay. `compose.yaml` passes the R6 settings through
+and publishes ports 30020-30022, which answer only when `r6` is enabled.
+
 ```sh
-TUBISOFT_GAMES=xiii,r6 ...
-docker compose -f compose.yaml -f deploy/compose.r6.yaml --env-file .env up -d --build
+# .env: TUBISOFT_GAMES=xiii,r6
+docker compose --env-file .env up -d --build
 curl --noproxy '*' 'http://127.0.0.1:18080/gsinit.php?dp=RAINBOWSIX3PS2US'
 ```
 
