@@ -113,8 +113,7 @@ def query_reply(profile: GameProfile, fields: list, username: str, *, ranking_st
         from .games.gr2_ladder import ranking_table
         table=ranking_table(profile,fields[2],username,ranking_store)
     elif account_db is not None and profile.match_ladder(account_db) is not None:
-        from .games.r6_ladder import ranking_table
-        table = ranking_table(profile, fields[2], username, account_db)
+        table = profile.ladder_ranking_table(fields[2], username, account_db)
     else:table = profile.ranking_table(fields[2], username)
     # 0x004c6a70 reconstructs the SDK result and appends the transport
     # correlation ID. Do not put the application's separate ID in its place.

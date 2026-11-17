@@ -27,6 +27,8 @@ class RoomSpec:
     game_version: str
     sdk_version: str
     local_ip: str
+    # A protected room's join password (Brothers in Arms); never logged.
+    password: str = ""
 
 
 @dataclass(frozen=True)
@@ -50,8 +52,29 @@ class GameProfile:
     # Parent-lobby member announcements (operations 50/51) on the lobby
     # connection itself, rather than XIII's host UDP channel.
     lobby_members: bool = False
+    # 0x62 is R6's personal-info update, whose fifth field is the country.
+    # Other titles use the same message number for different fields.
+    profile_country_update: bool = False
+    # Whether a parent join also announces the joining player to itself
+    # (operation 50 with its own name). Brothers in Arms completes the join
+    # only on that event; R6 completes it on the operation-23 reply.
+    self_member_event: bool = False
+    # Whether a group refresh (operation 9) re-sends the known members. R6
+    # needs this after leaving a room. Titles with finer rules override
+    # group_refresh (Brothers in Arms).
+    refresh_resends_members: bool = True
+    # Whether a room's creator also receives the new room's listing. The
+    # Brothers in Arms creator waits for its own room's record.
+    creator_room_listing: bool = False
+    # Byte order of the NAT server's reported address, a 32-bit decimal.
+    # "little" puts the first octet in the low byte: the in-memory s_addr
+    # that XIII's callback compares with inet_aton output. Brothers in Arms
+    # reads it as a host-order integer, first octet in the high byte.
+    nat_address_byteorder: str = "little"
     # Game rooms use non-positive group IDs; lobbies stay positive.
     negative_room_ids: bool = False
+    # Whether operation 106 (join a friend's lobby or game) is answered.
+    friend_joining: bool = False
     # Whether joining guests receive GAME_STARTED (operation 56).
     game_started: bool = True
     # The two login notices ("Latest News"); TUBISOFT_<SLUG>_NEWS_1/_2
@@ -107,6 +130,35 @@ class GameProfile:
     def game_started_fields(self, room: Room) -> list:
         raise UnsupportedOperation(f"{self.slug} join completion is not implemented")
 
+    def host_endpoint(self, room: Room, peer_ip: str) -> str:
+        # Where guests connect, as `endpoint_shape` describes it, when the
+        # title advertises it in the room's game data.
+        return "unknown"
+
+    def group_refresh(self, values: list) -> tuple[bool, bool]:
+        # Operation 9: whether the reply lists the child rooms, and whether
+        # the known members follow.
+        return True, self.refresh_resends_members
+
+    def friend_presence(self, in_room: bool) -> tuple[int, str]:
+        # GS friend status and product for a player in this title's parent
+        # lobby (in_room False) or in one of its rooms: 0 online, 9 in game.
+        return (9, self.product) if in_room else (0, "")
+
+    def room_update_event(self, room: Room, subtype: int) -> list | None:
+        # A push for every parent-lobby member after an accepted owner
+        # update, or None.
+        return None
+
+    def friend_location(self, member) -> list:
+        # Operation 106 location records for a friend in the parent lobby
+        # (`friend_joining` titles only).
+        raise UnsupportedOperation(f"{self.slug} friend joining is not implemented")
+
+    def room_join_failure(self, room: Room, reason: str) -> list | None:
+        # Data for an operation-24 GSFAIL reply, or None to close instead.
+        return None
+
     def room_join_result(self, room: Room) -> list:
         return [str(room.room_id)]
 
@@ -160,3 +212,7 @@ class GameProfile:
     def match_ladder(self, account_db):
         # Stored match ladder for titles whose results the service rates.
         return None
+
+    def ladder_ranking_table(self, fields: list, username: str, account_db) -> list:
+        # Ranking query answered from the title's stored ladder.
+        return self.ranking_table(fields, username)

@@ -10,6 +10,8 @@ XIII remains enabled by default. Ghost Recon 2 is an opt-in experimental profile
 
 Rainbow Six 3 (`r6`, `RAINBOWSIX3PS2US`) is a second opt-in experimental profile. Two retail clients (PCSX2) have signed in, hosted and joined each other's games, played rounds with results recorded on a Tubisoft ladder (its own Elo rating, not Ubisoft's formula), and used friends, messages, the ignore list and country settings. It has only been tested with two players, and the dedicated-server sign-in stages are not traced. Enable it with `TUBISOFT_GAMES=xiii,r6` in `.env`; `compose.yaml` already publishes its ports. See [Rainbow Six 3 notes](docs/rainbow-six-3-network.md).
 
+Brothers in Arms: Road to Hill 30 (`bia`, `BROTHERSINARMSPS2US`) is a third opt-in experimental profile. Two retail clients (PCSX2) have signed in, created and joined protected matches, joined a friend's game from the friends list, and played Friendly and Ladder matches to the end, including a next round in the same room. Results feed a stored ladder whose SCORE is Tubisoft's own rule (3 points per Ladder win, 1 per other Ladder match), not Ubisoft's original formula; Ladder results reach the in-game Stats screen. Enable it with `TUBISOFT_GAMES=xiii,bia`; `compose.yaml` already publishes its ports (30030-30032). See [Brothers in Arms notes](docs/brothers-in-arms-network.md).
+
 The independent Python gameplay worker, private data preparation tools and historical emulator research live in [gr2-ps2-dedicated-server](https://github.com/princebyyourlogic/gr2-ps2-dedicated-server). Tubisoft contains only shared services and the validated worker-directory interface. See [GR2 workers](docs/gr2-workers.md) and [GR2 protocol research](docs/ghost-recon-2-network.md).
 
 ## Run a beta instance

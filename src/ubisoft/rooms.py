@@ -29,6 +29,7 @@ class Room:
     game_version: str
     sdk_version: str
     local_ip: str = ""
+    password: str = field(default="", repr=False)
     profile: GameProfile = field(default=XIII, repr=False)
     # The owner's sign-in name exactly as the game sent it; `owner` is the
     # case-folded identity used for authorization.
