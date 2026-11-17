@@ -56,7 +56,11 @@ class Session:
 
 
 class Discovery(asyncio.DatagramProtocol):
-    def __init__(self, allowed_cidr: str = "127.0.0.0/8", host_alias=None) -> None:
+    def __init__(self, allowed_cidr: str = "127.0.0.0/8", host_alias=None,
+                 address_byteorder: str = "little") -> None:
+        if address_byteorder not in ("little", "big"):
+            raise ValueError("address byte order must be little or big")
+        self.address_byteorder = address_byteorder
         self.allowed = networks(allowed_cidr)
         # Replies still go to the real source; only the reported address changes.
         self.host_alias = host_alias
@@ -160,9 +164,10 @@ class Discovery(asyncio.DatagramProtocol):
         # source port mapped even after the address lookup has completed.
         self.send(packet, peer)
         if request.address_reply is None:
-            # The callback compares this native s_addr with inet_aton output.
+            # XIII's callback compares the native s_addr ("little") with
+            # inet_aton output; Brothers in Arms reads a host-order word.
             observed = self.host_alias(peer[0]) if self.host_alias is not None else peer[0]
-            address = int.from_bytes(ipaddress.IPv4Address(observed).packed, "little")
+            address = int.from_bytes(ipaddress.IPv4Address(observed).packed, self.address_byteorder)
             sequence, reply = self.reply(session, request, "3", address, peer[1])
             request.address_sequence = sequence
             request.address_reply = reply

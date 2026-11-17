@@ -3,11 +3,12 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 
 from .base import GameProfile
+from .bia import PROFILE as BIA
 from .gr2 import PROFILE as GR2
 from .r6 import PROFILE as R6
 from .xiii import PROFILE as XIII
 
-PROFILES = MappingProxyType({profile.slug: profile for profile in (XIII, GR2, R6)})
+PROFILES = MappingProxyType({profile.slug: profile for profile in (XIII, GR2, R6, BIA)})
 
 
 @dataclass(frozen=True)

@@ -78,6 +78,7 @@ Production defaults are unchanged:
 | `xiii` | `XIIIPS2US` | 30000 | 30001 | 30002 | Existing open beta; client gameplay exercised |
 | `gr2` | `GHOSTRECON2PS2` | 30010 | 30011 | 30012 | Experimental; shared login/lobby and worker join to Ready verified; full gameplay pending |
 | `r6` | `RAINBOWSIX3PS2US` | 30020 | 30021 | 30022 | Experimental; two retail clients (PCSX2) hosted, joined and played rated matches; more than two players and dedicated-server stages untested |
+| `bia` | `BROTHERSINARMSPS2US` | 30030 | 30031 | 30032 | Experimental; two retail clients (PCSX2) created, joined and played Friendly and Ladder matches, including a next round; friend joining; stored ladder (Tubisoft's own SCORE) on the Stats screen |
 
 For a local Python development instance, set `TUBISOFT_GAMES=xiii,gr2` plus the
 usual advertised address and state directory. XIII retains the existing
@@ -97,7 +98,9 @@ curl --noproxy '*' 'http://127.0.0.1:18080/gsinit.php?dp=GHOSTRECON2PS2'
 
 Rainbow Six 3 needs no overlay: `compose.yaml` already passes its settings
 and publishes ports 30020-30022, so `TUBISOFT_GAMES=xiii,r6` in `.env` is
-enough. The ports answer only when `r6` is enabled.
+enough. The ports answer only when `r6` is enabled. Brothers in Arms works
+the same way with `bia` and ports 30030-30032 (`TUBISOFT_BIA_*` overrides);
+see [its notes](brothers-in-arms-network.md).
 
 Use the same Compose project and state volume. The GR2 file is an overlay on the existing
 service, not a second container/database. The common DNS/HTTP routing remains

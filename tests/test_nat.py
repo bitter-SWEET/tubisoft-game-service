@@ -238,6 +238,25 @@ class NatTests(unittest.IsolatedAsyncioTestCase):
         helper.datagram_received(b"junk", ("198.51.100.1", 7777))
         self.assertEqual(len(transport.sent), count)
 
+    async def test_host_order_titles_get_the_first_octet_in_the_high_byte(self):
+        # Brothers in Arms (CNatService 0x0060f230) prints the word byte 3
+        # first, so 192.0.2.2 must arrive as 0xc0000202.
+        helper = Discovery("192.0.2.0/24", address_byteorder="big")
+        transport = Transport()
+        helper.connection_made(transport)
+        self.addCleanup(helper.connection_lost, None)
+        control_peer = ("192.0.2.2", 1026)
+        self.handshake(helper, control_peer)
+        helper.datagram_received(control_request(), control_peer)
+        _, body = fields(transport.sent[-1][0])
+        token = int(body[1][1]).to_bytes(4, "big")
+        helper.datagram_received(token, (control_peer[0], 7777))
+        _, body = fields(transport.sent[-1][0])
+        self.assertEqual(body[0], "3")
+        self.assertEqual(int(body[1][1]), 0xc0000202)
+        with self.assertRaises(ValueError):
+            Discovery("192.0.2.0/24", address_byteorder="middle")
+
 
 if __name__ == "__main__":
     unittest.main()

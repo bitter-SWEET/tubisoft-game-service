@@ -140,6 +140,10 @@ class R6Profile(GameProfile):
         # clears that flag, so every member needs this event per match.
         return ["62", [str(room.room_id), str(match_id)]]
 
+    def ladder_ranking_table(self, fields: list, username: str, account_db) -> list:
+        from .r6_ladder import ranking_table
+        return ranking_table(self, fields, username, account_db)
+
     def match_ladder(self, account_db):
         from .r6_ladder import R6Ladder
         ladders = R6Profile._ladders
@@ -294,7 +298,7 @@ PROFILE = R6Profile(
     # Setup 0x003ff3d0: product, SDK version "RSPS21.0", game version "1.0".
     game_version="1.0", sdk_version="RSPS21.0", default_ports=(30020, 30021, 30022),
     supports_discovery=True, supports_rooms=True, lobby_create=True, owner_game_started=False,
-    lobby_members=True,
+    lobby_members=True, profile_country_update=True,
     news=("Welcome to Tubisoft, a community revival of the Rainbow Six 3 online service.",
           "Ladder ratings use Tubisoft's own Elo system, not Ubisoft's original formula."),
     # Game rooms have non-positive IDs: member callbacks 0x004034a0/0x00403220
