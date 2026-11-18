@@ -316,7 +316,10 @@ GS packets. Tubisoft's service is `ubisoft.irc`, on its own TCP port.
 
 Tubisoft's rules: a login is accepted only for a player signed in to the
 friends service (operation 0x4e) from the same address, with that
-player's own chat ID; a newer login replaces an older one. It sends 001,
+player's own chat ID; a newer login replaces an older one. Every later
+command is checked again, and when the friends session ends (sign-out or
+a dropped connection) the server sends ERROR and closes that player's chat
+connection; the game QUITs chat before it closes its friends session. It sends 001,
 ignores MODE and PASS, echoes JOIN and PART to the channel's members,
 answers PING, delivers PRIVMSG to a signed-in player's nick (dropped when
 the recipient ignores the sender; 401 when offline) or to the members of

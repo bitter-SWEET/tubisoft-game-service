@@ -177,7 +177,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
             if channel is not None and channel[0] is host_connection:
                 del registry.friend_channels[wait_user.casefold()]
                 registry.friend_lists.pop(wait_user.casefold(), None)
-                registry.chat_hosts.pop(wait_user.casefold(), None)
+                registry.end_chat(wait_user.casefold())
                 notify_presence(wait_user)
 
     def message_time() -> str:

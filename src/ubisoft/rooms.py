@@ -103,6 +103,9 @@ class RoomRegistry:
         # Address each signed-in friends channel connected from, by
         # case-folded name. The chat server admits only that address.
         self.chat_hosts: dict[str, str] = {}
+        # Called with a case-folded name when its friends session ends; the
+        # chat server closes that player's chat connection.
+        self.chat_revokers: list[Callable[[str], None]] = []
         self._next_match = 1
         # Operation 17 state (game mode) of recent matches by match ID.
         self.match_modes: dict[str, str] = {}
@@ -119,6 +122,12 @@ class RoomRegistry:
         self.worker_provider = None
         self._worker_id = None
         self._syncing_worker = False
+
+    def end_chat(self, key: str) -> None:
+        """Forget a signed-out player's chat address and revoke their chat session."""
+        self.chat_hosts.pop(key, None)
+        for revoke in list(self.chat_revokers):
+            revoke(key)
 
     def sync_worker(self) -> None:
         """Reflect a local, healthy dedicated worker without a synthetic owner player."""

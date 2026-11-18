@@ -640,6 +640,39 @@ class EIBChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(irc.parse(":n!u@h USER BIAEIBPS2US1.0 +i 0 :Name"),
                          ("USER", ["BIAEIBPS2US1.0", "+i", "0", "Name"]))
 
+    async def test_commands_are_rechecked_after_sign_out(self):
+        registry = RoomRegistry()
+        server = irc.ChatServer(registry, EIB, None)
+        sent = []
+
+        class Transport:
+            def is_closing(self):
+                return False
+
+            def get_write_buffer_size(self):
+                return 0
+
+        class Writer:
+            transport = Transport()
+
+            def write(self, packet):
+                sent.extend(irc.decode_payload(packet[2:]))
+
+        client = irc.Client(Writer(), ("192.0.2.5", 1), nick=EIB.player_info_id("Fixture"), user="Fixture",
+                            registered=True)
+        registry.friend_channels["fixture"] = (object(), print)
+        registry.chat_hosts["fixture"] = "192.0.2.5"
+        self.assertTrue(await server.dispatch(client, "PING", ["x"]))
+        self.assertEqual(sent[-1], ":tubisoft PONG tubisoft :x")
+        # The friends session is gone (or moved to another address): the
+        # next command closes the chat connection instead of being handled.
+        registry.chat_hosts["fixture"] = "192.0.2.6"
+        self.assertFalse(await server.dispatch(client, "PRIVMSG", ["pabc", "x%1%1%1%1%x%"]))
+        self.assertEqual(sent[-1], "ERROR :Closing link (tubisoft: signed out)")
+        del registry.friend_channels["fixture"]
+        self.assertFalse(await server.dispatch(client, "JOIN", ["#LobbyGrp2.1"]))
+        self.assertEqual(server.channels, {})
+
     async def test_signed_in_friends_exchange_a_lobby_invitation(self):
         with TemporaryDirectory() as directory:
             async with running_service(directory) as (ports, connect):
@@ -714,6 +747,11 @@ class EIBChatTests(unittest.IsolatedAsyncioTestCase):
                                  + chat_packet(f"PRIVMSG {target} :{invitation}".encode()))
                     second_writer.write(chat_packet(b"PING :y"))
                     self.assertEqual(await chat_receive(second), ":tubisoft PONG tubisoft :y")
+                    # Signing out of the friends service closes that player's
+                    # chat session (RoomRegistry.end_chat).
+                    inviter.writer.close()
+                    self.assertEqual(await chat_receive(first), "ERROR :Closing link (tubisoft: signed out)")
+                    self.assertEqual(await asyncio.wait_for(first.read(), 2), b"")
                 finally:
                     for writer in writers:
                         writer.close()

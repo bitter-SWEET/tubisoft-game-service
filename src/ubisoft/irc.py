@@ -16,7 +16,9 @@ PRIVMSG handler (0x005de460) only accepts those addressed to its own nick
 and hands them to the game (0x00502540). The client answers PING itself.
 
 Only players signed in to the friends service, from the same address, may
-log in, and only with their own IRCID. Logs never carry names or text.
+log in, and only with their own IRCID. Every later command is checked
+again, and a chat session is closed when its friends session ends
+(RoomRegistry.end_chat). Logs never carry names or text.
 """
 from __future__ import annotations
 
@@ -104,6 +106,7 @@ class ChatServer:
         self.clients: dict[str, Client] = {}
         self.channels: dict[str, set[Client]] = {}
         self.connections = 0
+        registry.chat_revokers.append(self.revoke)
 
     async def account_operation(self, operation, *arguments):
         if self.access_policy is None:
@@ -170,6 +173,12 @@ class ChatServer:
 
     async def dispatch(self, client: Client, command: str, params: list[str]) -> bool:
         """Handle one line; False closes the connection."""
+        if client.registered and command != "QUIT" and not self.signed_in(
+                client.user or "", client.peer[0] if client.peer else ""):
+            # The friends session ended after this chat login.
+            client.send(f"ERROR :Closing link ({SERVER_NAME}: signed out)")
+            LOG.info("chat session revoked game=%s peer=%s reason=signed-out", self.game_profile.slug, client.peer)
+            return False
         if command == "PING":
             client.send(f":{SERVER_NAME} PONG {SERVER_NAME} :{params[-1] if params else SERVER_NAME}")
             return True
@@ -295,6 +304,15 @@ class ChatServer:
             client.send(f":{SERVER_NAME} 401 {client.nick} {target} :No such nick")
         LOG.info("chat private message game=%s peer=%s outcome=%s text_bytes=%d fields=%d",
                  self.game_profile.slug, client.peer, outcome, len(text.encode("latin-1")), text.count("%") + 1)
+
+    def revoke(self, key: str) -> None:
+        """Close the chat sessions of a player whose friends session ended."""
+        for client in [c for c in self.clients.values() if (c.user or "").casefold() == key]:
+            client.send(f"ERROR :Closing link ({SERVER_NAME}: signed out)")
+            self.depart(client)
+            client.writer.close()
+            LOG.info("chat session revoked game=%s peer=%s reason=friends-session-ended",
+                     self.game_profile.slug, client.peer)
 
     def depart(self, client: Client) -> None:
         if client.registered and client.nick is not None and self.clients.get(client.nick.casefold()) is client:
